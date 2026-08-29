@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext, FailureObservation, ModelRef } from './types.ts'
 import { classifyFailure, parseRetryAfter } from './classify.ts'
-import { candidateSnapshot, effectiveCandidates, chooseCandidate } from './candidates.ts'
+import { candidateSnapshot, effectiveCandidates, chooseCandidate, summarizeCandidateHealth } from './candidates.ts'
 import { HealthStore, endpointKey, modelKey } from './health.ts'
 
 const FIRST_RESPONSE_TIMEOUT = 90_000
@@ -49,16 +49,11 @@ export default function (pi: ExtensionAPI) {
   const status = (ctx: ExtensionContext) => {
     const state = health.snapshot
     const { models } = candidateSnapshot(ctx.scopedModels, ctx.modelRegistry.getAvailable())
-    const now = Date.now()
-    const disabled = Object.values(state.models).filter(item => item.disabled).length
-    const cooling = [...Object.values(state.models), ...Object.values(state.providers), ...Object.values(state.endpoints)]
-      .filter(item => item.cooldownUntil && item.cooldownUntil > now).length
-    const unhealthy = models.filter(model => health.isBlocked(model)).length
-    const healthy = Math.max(0, models.length - unhealthy)
+    const counts = summarizeCandidateHealth(models, state)
     const plain = round?.phase === 'switching' ? `CCS ↻${round.attempts}/${MAX_ATTEMPTS} ${round.model ? modelKey(round.model) : ''}` :
-      cooling || disabled ? `CCS ✓${healthy}/${models.length} · ⏳${cooling} · ⛔${disabled}` : `CCS ✓${models.length}`
+      counts.cooling || counts.disabled ? `CCS ✓${counts.healthy}/${counts.total} · ⏳${counts.cooling} · ⛔${counts.disabled}` : `CCS ✓${counts.total}`
     const theme = ctx.ui.theme
-    ctx.ui.setStatus('ccswitch-ha', theme ? theme.fg(cooling || disabled ? 'warning' : 'success', plain) : plain)
+    ctx.ui.setStatus('ccswitch-ha', theme ? theme.fg(counts.cooling || counts.disabled ? 'warning' : 'success', plain) : plain)
   }
   const notify = (ctx: ExtensionContext, message: string, type: 'info' | 'warning' | 'error' = 'info') => {
     if (ctx.hasUI) ctx.ui.notify(message, type)
@@ -83,19 +78,22 @@ export default function (pi: ExtensionAPI) {
     const state = health.snapshot
     const snapshot = candidateSnapshot(ctx.scopedModels, ctx.modelRegistry.getAvailable())
     const candidates = snapshot.models
-    const healthy = candidates.filter(model => !health.isBlocked(model)).length
+    const counts = summarizeCandidateHealth(candidates, state)
+    const now = Date.now()
     const rows = candidates.slice(0, 10).map(model => {
-      const record = state.models[modelKey(model)] ?? state.providers[model.provider]
-      const suffix = record?.disabled ? '禁用' : record?.cooldownUntil && record.cooldownUntil > Date.now() ? `冷却 ${Math.ceil((record.cooldownUntil - Date.now()) / 60_000)}m` : '健康'
+      const modelRecord = state.models[modelKey(model)]
+      const records = [modelRecord, state.providers[model.provider], state.endpoints[endpointKey(model)]]
+      const blockedUntil = Math.max(0, ...records.flatMap(record => [record?.cooldownUntil ?? 0, record?.leaseUntil ?? 0]))
+      const suffix = modelRecord?.disabled ? '手动禁用' : blockedUntil > now ? `自动冷却 ${Math.max(1, Math.ceil((blockedUntil - now) / 60_000))}m` : '健康'
       return `${modelKey(model)}  ${suffix}`
     })
     if (!ctx.ui.select) {
       const source = snapshot.source === 'scoped' ? `Pi scope ${snapshot.sourceEntries} 条` : `Pi 注册表 ${snapshot.sourceEntries} 条`
-      notify(ctx, `CCSwitch：${source} · 唯一模型 ${candidates.length} · 健康 ${healthy}`, 'info')
+      notify(ctx, `CCSwitch：${source} · 唯一模型 ${counts.total} · 健康 ${counts.healthy} · 自动冷却 ${counts.cooling} · 手动禁用 ${counts.disabled}`, 'info')
       return
     }
     const scopeLabel = snapshot.source === 'scoped' ? `Pi scope：${snapshot.sourceEntries} 条` : `Pi 可用注册表：${snapshot.sourceEntries} 条`
-    const action = await ctx.ui.select(`CCSwitch 健康面板\n当前：${key(ctx.model) ?? '无'}\n${scopeLabel} · 唯一模型：${candidates.length} · 健康：${healthy}\n${rows.join('\n') || '没有可用模型'}`, ['刷新', '重新激活当前模型', '禁用当前模型', '重置当前模型历史', '关闭'])
+    const action = await ctx.ui.select(`CCSwitch 健康面板\n当前：${key(ctx.model) ?? '无'}\n${scopeLabel} · 唯一模型：${counts.total} · 健康：${counts.healthy} · 自动冷却：${counts.cooling} · 手动禁用：${counts.disabled}\n熔断记录：${counts.breakerRecords}\n${rows.join('\n') || '没有可用模型'}`, ['刷新', '重新激活当前模型', '禁用当前模型', '重置当前模型历史', '关闭'])
     if (action === '刷新') await refresh(ctx)
     if (action === '重新激活当前模型' && ctx.model) { health.reactivate(ctx.model); await health.flush(); status(ctx); notify(ctx, '已重新激活当前模型') }
     if (action === '禁用当前模型' && ctx.model) { health.disable(modelKey(ctx.model), true); await health.flush(); status(ctx); notify(ctx, '已禁用当前模型', 'warning') }
@@ -238,8 +236,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand('ccswitch-test', { description: '检查 CCSwitch 候选模型和健康状态（不切换模型）', handler: async (_args, ctx) => {
     await refresh(ctx)
     const snapshot = candidateSnapshot(ctx.scopedModels, ctx.modelRegistry.getAvailable())
-    const healthy = snapshot.models.filter(model => !health.isBlocked(model)).length
+    const counts = summarizeCandidateHealth(snapshot.models, health.snapshot)
     const source = snapshot.source === 'scoped' ? `Pi scope ${snapshot.sourceEntries} 条` : `Pi 注册表 ${snapshot.sourceEntries} 条`
-    notify(ctx, `CCSwitch 自检：${source} · 唯一模型 ${snapshot.models.length} · 健康 ${healthy}`, snapshot.models.length ? 'info' : 'warning')
+    notify(ctx, `CCSwitch 自检：${source} · 唯一模型 ${counts.total} · 健康 ${counts.healthy} · 自动冷却 ${counts.cooling} · 手动禁用 ${counts.disabled} · 熔断记录 ${counts.breakerRecords}`, counts.total ? 'info' : 'warning')
   }})
 }

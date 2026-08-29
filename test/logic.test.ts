@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { classifyFailure, parseRetryAfter } from '../classify.ts'
-import { candidateSnapshot, chooseCandidate, effectiveCandidates } from '../candidates.ts'
+import { candidateSnapshot, chooseCandidate, effectiveCandidates, summarizeCandidateHealth } from '../candidates.ts'
 import type { ModelRef } from '../types.ts'
 
 const a: ModelRef = { provider: 'a', id: 'coder', contextWindow: 128000, reasoning: true, input: ['text'] }
@@ -47,6 +47,22 @@ test('reports raw scoped entries separately from unique models', () => {
   assert.equal(snapshot.source, 'scoped')
   assert.equal(snapshot.sourceEntries, 3)
   assert.equal(snapshot.models.length, 2)
+})
+
+test('counts models affected by a provider breaker instead of breaker records', () => {
+  const now = Date.now()
+  const affected = {
+    ...health,
+    models: { 'b/coder': { consecutiveFailures: 0, totalFailures: 0, disabled: true } },
+    providers: { a: { consecutiveFailures: 1, totalFailures: 1, cooldownUntil: now + 60_000 } },
+  }
+  assert.deepEqual(summarizeCandidateHealth([a, a2, b], affected, now), {
+    total: 3,
+    healthy: 0,
+    cooling: 2,
+    disabled: 1,
+    breakerRecords: 1,
+  })
 })
 
 test('parses numeric and HTTP-date retry-after headers', () => {

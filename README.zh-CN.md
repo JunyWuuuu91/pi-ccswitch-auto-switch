@@ -58,15 +58,15 @@ pi install npm:pi-ccswitch-auto-switch
 ## 状态栏
 
 ```text
-CCS ✓70/71 · ⏳1 · ⛔0
+CCS ✓70/131 · ⏳61 · ⛔0
 ```
 
-- `✓70/71`：Pi 有效范围内共有 71 个去重后的 `provider/model` 组合，其中 70 个健康；重复的 scope 条目只计一次。
-- `⏳1`：有一条模型、Provider 或端点健康记录仍在冷却。
+- `✓70/131`：Pi 有效范围内共有 131 个去重后的 `provider/model` 组合，其中 70 个健康；重复的 scope 条目只计一次。
+- `⏳61`：有 61 个模型正受模型、Provider 或端点自动冷却影响；一条 Provider 熔断记录可能同时影响许多模型。
 - `⛔0`：没有被手动禁用的模型。
 - 切换中出现 `CCS ↻2/5 provider/model`，表示正在进行最多 5 次尝试中的第 2 次。
 
-全部唯一模型都健康时会压缩显示为 `CCS ✓71`。通过 `/ccswitch` 或 `/ccswitch-test` 可同时查看 Pi 原始 scope 条目数、去重模型数、健康数，以及具体哪个记录正在冷却。
+全部唯一模型都健康时会压缩显示为 `CCS ✓131`。通过 `/ccswitch` 或 `/ccswitch-test` 可同时查看 Pi 原始 scope 条目数、去重模型数、受影响模型数和底层熔断记录数。
 
 ## 故障转移逻辑
 
