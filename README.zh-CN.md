@@ -1,0 +1,104 @@
+# Pi CCSwitch 自动故障转移
+
+> English: [README.md](README.md)
+
+当 [CC Switch](https://ccswitch.io/) 管理 [Pi](https://github.com/badlogic/pi-mono) 的 Provider 时，为 Pi 提供更稳健的模型自动故障转移。
+
+它只观察 Pi 的真实请求，保存脱敏健康记录；仅在 TUI/RPC 交互会话中，才会把失败请求平滑切到健康模型。额度耗尽、凭据失效或限流等 Provider 级问题会直接熔断整个 Provider，不会连续尝试同一 Provider 下的多个兄弟模型。
+
+## 功能
+
+- 以 Pi 的有效模型注册表为准，不读取 CC Switch 数据库、Pi 认证文件或 API Key。
+- 对认证、额度、账单和限流实施 Provider 优先熔断。
+- 对 DNS、连接、服务端和流中断实施端点熔断。
+- 模型不存在或参数不兼容时仅隔离该模型。
+- 优先选择不同 Provider 的健康模型；同 Provider 的模型排在后面。
+- 首响应 90 秒、流式停滞 120 秒看门狗。
+- 指数退避、`Retry-After` 支持和跨进程 half-open 单探针租约。
+- 原子持久化状态、错误脱敏和有上限的日志。
+- Pi 紧凑状态栏与健康管理面板。
+- `--print` / JSON 非交互运行只监控和记录，不会注入可能与进程退出竞争的新请求。
+
+## 要求
+
+- Pi `0.84.4` 或更高版本。
+- 建议使用 CC Switch `3.20+`，其已支持原生维护 Pi 模型配置。
+- 本地开发和测试需要 Node.js `22.19+`；Pi 运行插件本身不需要额外安装 Node。
+
+## 安装
+
+### macOS / Linux
+
+```bash
+git clone https://github.com/JunyWuuuu91/pi-ccswitch-auto-switch.git \
+  ~/.pi/agent/extensions/ccswitch-auto-switch
+```
+
+### Windows PowerShell
+
+```powershell
+git clone https://github.com/JunyWuuuu91/pi-ccswitch-auto-switch.git `
+  "$env:USERPROFILE\.pi\agent\extensions\ccswitch-auto-switch"
+```
+
+若设置了自定义 `PI_CODING_AGENT_DIR`，请克隆到 `%PI_CODING_AGENT_DIR%/extensions/ccswitch-auto-switch`。安装或更新后重启 Pi，或执行 `/reload`。
+
+正常使用 CC Switch 配置 Provider 即可；本插件不会修改 Pi 模型设置或 CC Switch 数据。
+
+## 命令
+
+| 命令 | 作用 |
+| --- | --- |
+| `/ccswitch` 或 `/ccswitch status` | 打开健康面板。 |
+| `/ccswitch help` | 在 Pi 内显示命令帮助。 |
+| `/ccswitch refresh` | 刷新 Pi 模型注册表和状态栏。 |
+| `/ccswitch reactivate <provider/model\|all>` | 解除熔断，下一次真实请求验证恢复情况；保留历史。 |
+| `/ccswitch disable <provider/model>` | 手动排除模型。 |
+| `/ccswitch reset <provider/model\|all>` | 确认后删除相应健康历史。 |
+| `/ccswitch-test` | 仅检查候选发现，不切换模型。 |
+
+## 状态栏
+
+```text
+CCS ✓130 · ⏳1 · ⛔0
+```
+
+- `✓130`：当前可参与选择的有效模型数量。
+- `⏳1`：有一条模型、Provider 或端点健康记录仍在冷却。
+- `⛔0`：没有被手动禁用的模型。
+- 切换中出现 `CCS ↻2/5 provider/model`，表示正在进行最多 5 次尝试中的第 2 次。
+
+通过 `/ccswitch` 查看具体哪个记录正在冷却。
+
+## 故障转移逻辑
+
+插件会先等待 Pi 内置重试结束和会话恢复 idle，再进行切换。新的用户输入会使旧轮次的待切换任务失效，从而避免重复发送。
+
+| 失败类型 | 熔断范围 | 初始冷却 |
+| --- | --- | --- |
+| `401`、`403`、额度或账单问题 | Provider | 30 分钟 |
+| `429` | Provider | 优先使用 `Retry-After`，否则 5 分钟 |
+| DNS、网络、`5xx`、流中断 | 端点 | 2 分钟 |
+| `404`、模型不存在、参数不兼容 | 模型 | 15 分钟 |
+| 内容过滤、上下文溢出 | 仅本轮 | 无 |
+
+冷却时间会指数增长但有上限。上下文溢出时只会选择上下文窗口更大的模型。用户主动取消不计失败；看门狗取消会记录为超时。
+
+## 数据与隐私
+
+健康状态保存在 Pi agent 目录的 `ccswitch-auto-switch-state.json`。其中只有计数、时间、冷却信息和脱敏/截断的错误摘要；插件不会访问凭据、Authorization 请求头、CC Switch 数据库或 Pi 的 `auth.json`。
+
+## 开发
+
+```bash
+npm install
+npm run typecheck
+npm test
+```
+
+测试使用 Node 内置测试运行器，覆盖失败分类、Provider 优先选择、冷却、状态持久化以及 Windows 路径。
+
+## 许可证
+
+[MIT](LICENSE)
+

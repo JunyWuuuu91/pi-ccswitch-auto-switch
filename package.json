@@ -1,0 +1,17 @@
+{
+  "name": "pi-ccswitch-auto-switch",
+  "version": "0.1.0",
+  "description": "Provider-first automatic model failover extension for Pi and CC Switch",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit --allowImportingTsExtensions --module nodenext --moduleResolution nodenext --target es2022 --skipLibCheck *.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.19"
+  }
+}
