@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { classifyFailure, parseRetryAfter } from '../classify.ts'
 import { candidateSnapshot, chooseCandidate, effectiveCandidates, summarizeCandidateHealth } from '../candidates.ts'
+import { endpointKey } from '../health.ts'
 import type { ModelRef } from '../types.ts'
 
 const a: ModelRef = { provider: 'a', id: 'coder', contextWindow: 128000, reasoning: true, input: ['text'] }
@@ -68,4 +69,31 @@ test('counts models affected by a provider breaker instead of breaker records', 
 test('parses numeric and HTTP-date retry-after headers', () => {
   assert.equal(parseRetryAfter('12'), 12000)
   assert.equal(parseRetryAfter('bad header'), undefined)
+})
+
+test('skips sibling models sharing the same isolated endpoint (BaseURL)', () => {
+  // 三个模型同 BaseURL 但 provider/id 不同，模拟同一端点平台下的多个模型
+  const ep1: ModelRef = { provider: 'x', id: 'm1', baseUrl: 'https://api.example.com/v1', contextWindow: 128000 }
+  const ep1b: ModelRef = { provider: 'x', id: 'm2', baseUrl: 'https://api.example.com/v1', contextWindow: 128000 }
+  const other: ModelRef = { provider: 'y', id: 'm3', baseUrl: 'https://api.other.com/v1', contextWindow: 128000 }
+  const isolated = new Set([endpointKey(ep1)])
+  const next = chooseCandidate([ep1, ep1b, other], { current: ep1, tried: new Set(['x/m1']), health, avoidEndpoints: isolated })
+  assert.equal(next?.provider, 'y')
+})
+
+test('still selects a sibling on the same endpoint when it is not isolated', () => {
+  const ep1: ModelRef = { provider: 'x', id: 'm1', baseUrl: 'https://api.example.com/v1', contextWindow: 128000 }
+  const ep1b: ModelRef = { provider: 'x', id: 'm2', baseUrl: 'https://api.example.com/v1', contextWindow: 128000 }
+  const next = chooseCandidate([ep1, ep1b], { current: ep1, tried: new Set(['x/m1']), health, avoidEndpoints: new Set() })
+  assert.equal(next?.id, 'm2')
+})
+
+test('same baseURL on different providers are independent endpoints (copy-vendor semantics)', () => {
+  // b-ai 与复制的 b-ai-copy 共享 baseURL，但必须视为独立端点，互不连坐
+  const bai: ModelRef = { provider: 'b-ai', id: 'deepseek-v4-flash', baseUrl: 'https://api.b.ai/v1', contextWindow: 128000 }
+  const baiCopy: ModelRef = { provider: 'b-ai-copy', id: 'deepseek-v4-flash', baseUrl: 'https://api.b.ai/v1', contextWindow: 128000 }
+  assert.notEqual(endpointKey(bai), endpointKey(baiCopy))
+  // 隔离 b-ai 端点后，b-ai-copy 仍是健康候选
+  const next = chooseCandidate([bai, baiCopy], { current: bai, tried: new Set(['b-ai/deepseek-v4-flash']), health, avoidEndpoints: new Set([endpointKey(bai)]) })
+  assert.equal(next?.provider, 'b-ai-copy')
 })

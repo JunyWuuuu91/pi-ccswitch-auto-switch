@@ -11,8 +11,10 @@ The extension observes real Pi requests, records sanitized health signals, andâ€
 - Uses Pi's effective model registry; never reads CC Switch databases, Pi auth files, or API keys.
 - Provider-first circuit breakers for authentication, quota, billing, and rate-limit failures.
 - Endpoint circuit breakers for DNS, connection, server, and streaming failures.
+- Endpoint platform isolation: when several models on the same endpoint (same BaseURL/provider) fail within one round, the whole endpoint is isolated so sibling models from the same platform are not tried one by one.
 - Model-only isolation for missing models and incompatible parameters.
 - Prefers a healthy model from another provider before considering a sibling model.
+  - Independent-provider semantics: a copied vendor (e.g. `b-ai-copy`) shares the BaseURL but is a distinct provider with its own endpoint key, so isolating one never blocks the other.
 - 90-second first-response and 120-second streaming-idle watchdogs.
 - Exponential cooldowns, `Retry-After` support, and one persisted half-open probe lease per provider.
 - Persistent, atomic, cross-process health state with error redaction and bounded logs.

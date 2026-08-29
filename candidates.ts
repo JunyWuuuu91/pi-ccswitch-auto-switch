@@ -6,6 +6,7 @@ export interface CandidateOptions {
   tried: Set<string>
   failureKind?: string
   health: HealthState
+  avoidEndpoints?: Set<string>
 }
 
 export interface CandidateSnapshot {
@@ -74,6 +75,7 @@ export function chooseCandidate(models: ModelRef[], options: CandidateOptions): 
   const current = options.current
   const candidates = models.filter(model => {
     if (options.tried.has(modelKey(model)) || blocked(model, options.health)) return false
+    if (options.avoidEndpoints?.has(endpointKey(model))) return false
     if (options.failureKind === 'context_overflow' && current && (model.contextWindow ?? 0) <= (current.contextWindow ?? 0)) return false
     return true
   })

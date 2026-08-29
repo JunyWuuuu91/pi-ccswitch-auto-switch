@@ -7,6 +7,13 @@ const FIRST_RESPONSE_TIMEOUT = 90_000
 const STREAM_IDLE_TIMEOUT = 120_000
 const MAX_ATTEMPTS = 5
 const ROUND_LIMIT = 8 * 60_000
+// 同端点（BaseURL 相同）连续失败达到该次数即隔离该端点，避免同一个平台的多个模型逐个试错耗尽本轮切换
+const ENDPOINT_FAIL_THRESHOLD = 3
+
+interface EndpointFailTracker {
+  failed: Map<string, number>
+  isolated: Set<string>
+}
 
 type Phase = 'idle' | 'monitoring' | 'settled-error' | 'switching' | 'redispatching' | 'verifying' | 'exhausted'
 interface Round {
@@ -24,6 +31,7 @@ interface Round {
   cleanRetry: boolean
   observation?: FailureObservation
   model?: ModelRef
+  endpointFails?: EndpointFailTracker
 }
 
 function key(model: ModelRef | undefined): string | undefined { return model && modelKey(model) }
@@ -119,20 +127,30 @@ export default function (pi: ExtensionAPI) {
     if (round.observation.aborted && !round.observation.watchdog) { round.phase = 'idle'; clearWatchdog(); status(ctx); return }
     round.phase = 'switching'
     round.tried.add(modelKey(round.model))
+    // 跟踪同端点失败：BaseURL 相同的模型同属一个端点平台，连续失败到阈值后隔离整个端点，
+    // 避免同一平台下的多个模型逐个试错（它们往往共享同一故障根源）
+    const failTracker = round.endpointFails ??= { failed: new Map(), isolated: new Set() }
+    const ep = endpointKey(round.model)
+    const epFails = (failTracker.failed.get(ep) ?? 0) + 1
+    failTracker.failed.set(ep, epFails)
+    if (epFails >= ENDPOINT_FAIL_THRESHOLD) {
+      failTracker.isolated.add(ep)
+      await health.log(`endpoint ${ep} failed ${epFails} times this round, isolating endpoint`)
+    }
     if (!classification.roundOnly && classification.scope) health.recordFailure(classification.scope, classification.scope === 'model' ? modelKey(round.model) : classification.scope === 'provider' ? round.model.provider : endpointKey(round.model), classification.kind, round.observation.message, classification.retryAfterMs)
     await health.flush()
     await refresh(ctx)
     const candidates = effectiveCandidates(ctx.scopedModels, ctx.modelRegistry.getAvailable())
-    let next = chooseCandidate(candidates, { current: round.model, tried: round.tried, failureKind: classification.kind, health: health.snapshot })
+    let next = chooseCandidate(candidates, { current: round.model, tried: round.tried, failureKind: classification.kind, health: health.snapshot, avoidEndpoints: failTracker.isolated })
     while (next) {
-      if (!await health.claimProvider(next)) { round.tried.add(modelKey(next)); next = chooseCandidate(candidates, { current: round.model, tried: round.tried, failureKind: classification.kind, health: health.snapshot }); continue }
+      if (!await health.claimProvider(next)) { round.tried.add(modelKey(next)); next = chooseCandidate(candidates, { current: round.model, tried: round.tried, failureKind: classification.kind, health: health.snapshot, avoidEndpoints: failTracker.isolated }); continue }
       round.attempts++
       ctx.ui.setWorkingMessage(`模型异常，正在切换到 ${modelKey(next)}…`)
       const set = await pi.setModel(next).catch(() => false)
       if (!set) {
         health.recordFailure('model', modelKey(next), 'model_config', 'Pi refused model selection')
         round.tried.add(modelKey(next)); await health.flush()
-        next = chooseCandidate(candidates, { current: round.model, tried: round.tried, failureKind: classification.kind, health: health.snapshot })
+        next = chooseCandidate(candidates, { current: round.model, tried: round.tried, failureKind: classification.kind, health: health.snapshot, avoidEndpoints: failTracker.isolated })
         continue
       }
       round.model = next
@@ -158,7 +176,7 @@ export default function (pi: ExtensionAPI) {
     if (event.source === 'extension') return { action: 'continue' }
     clearWatchdog()
     lastStatus = {}
-    round = { id: (round?.id ?? 0) + 1, phase: 'monitoring', startedAt: Date.now(), text: event.text, images: event.images, tried: new Set(), attempts: 0, hadTool: false, inTool: false, hadOutput: false, watchdog: false, cleanRetry: false, model: ctx.model }
+    round = { id: (round?.id ?? 0) + 1, phase: 'monitoring', startedAt: Date.now(), text: event.text, images: event.images, tried: new Set(), attempts: 0, hadTool: false, inTool: false, hadOutput: false, watchdog: false, cleanRetry: false, model: ctx.model, endpointFails: undefined }
     status(ctx)
     return { action: 'continue' }
   })
