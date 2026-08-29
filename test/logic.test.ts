@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { classifyFailure, parseRetryAfter } from '../classify.ts'
-import { chooseCandidate, effectiveCandidates } from '../candidates.ts'
+import { candidateSnapshot, chooseCandidate, effectiveCandidates } from '../candidates.ts'
 import type { ModelRef } from '../types.ts'
 
 const a: ModelRef = { provider: 'a', id: 'coder', contextWindow: 128000, reasoning: true, input: ['text'] }
@@ -40,6 +40,13 @@ test('context failure only selects larger contexts', () => {
 
 test('uses scoped models when supplied', () => {
   assert.deepEqual(effectiveCandidates([{ model: b }], [a, b]).map(model => model.provider), ['b'])
+})
+
+test('reports raw scoped entries separately from unique models', () => {
+  const snapshot = candidateSnapshot([{ model: a }, { model: a }, { model: b }], [big])
+  assert.equal(snapshot.source, 'scoped')
+  assert.equal(snapshot.sourceEntries, 3)
+  assert.equal(snapshot.models.length, 2)
 })
 
 test('parses numeric and HTTP-date retry-after headers', () => {

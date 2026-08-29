@@ -8,6 +8,12 @@ export interface CandidateOptions {
   health: HealthState
 }
 
+export interface CandidateSnapshot {
+  models: ModelRef[]
+  source: 'scoped' | 'available'
+  sourceEntries: number
+}
+
 function blocked(model: ModelRef, health: HealthState, now = Date.now()): boolean {
   const records = [health.models[modelKey(model)], health.providers[model.provider], health.endpoints[endpointKey(model)]]
   return records.some(record => Boolean(record?.disabled || (record?.cooldownUntil && record.cooldownUntil > now) || (record?.leaseUntil && record.leaseUntil > now)))
@@ -22,6 +28,15 @@ export function effectiveCandidates(scoped: readonly ScopedModel[], available: M
     seen.add(key)
     return true
   })
+}
+
+export function candidateSnapshot(scoped: readonly ScopedModel[], available: ModelRef[]): CandidateSnapshot {
+  const source = scoped.length > 0 ? 'scoped' : 'available'
+  return {
+    models: effectiveCandidates(scoped, available),
+    source,
+    sourceEntries: source === 'scoped' ? scoped.length : available.length,
+  }
 }
 
 export function chooseCandidate(models: ModelRef[], options: CandidateOptions): ModelRef | undefined {

@@ -66,15 +66,15 @@ Examples:
 ## Status bar
 
 ```text
-CCS ✓130 · ⏳1 · ⛔0
+CCS ✓70/71 · ⏳1 · ⛔0
 ```
 
-- `✓130`: effective models currently eligible for selection.
+- `✓70/71`: 70 healthy models out of 71 unique `provider/model` combinations in Pi's effective scope. Duplicate scoped entries are counted once.
 - `⏳1`: one model, provider, or endpoint health record is cooling down.
 - `⛔0`: no manually disabled models.
 - During a switch, `CCS ↻2/5 provider/model` means the second of at most five attempts is being made.
 
-Use `/ccswitch` to inspect the exact record behind a cooldown.
+When all unique models are healthy, the compact form is `CCS ✓71`. Use `/ccswitch` or `/ccswitch-test` to see Pi's raw scope entry count, the deduplicated model count, the healthy count, and the exact record behind a cooldown.
 
 ## Failover behavior
 
