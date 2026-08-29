@@ -27,21 +27,19 @@ The extension observes real Pi requests, records sanitized health signals, andâ€
 
 ## Installation
 
-### macOS / Linux
+### Pi package install (recommended)
 
 ```bash
-git clone https://github.com/JunyWuuuu91/pi-ccswitch-auto-switch.git \
-  ~/.pi/agent/extensions/ccswitch-auto-switch
+pi install git:github.com/JunyWuuuu91/pi-ccswitch-auto-switch
 ```
 
-### Windows PowerShell
+This works on macOS, Linux, and Windows when Git is available. After the npm release, this will also work:
 
-```powershell
-git clone https://github.com/JunyWuuuu91/pi-ccswitch-auto-switch.git `
-  "$env:USERPROFILE\.pi\agent\extensions\ccswitch-auto-switch"
+```bash
+pi install npm:pi-ccswitch-auto-switch
 ```
 
-If Pi uses a custom agent directory, clone into `%PI_CODING_AGENT_DIR%/extensions/ccswitch-auto-switch` instead. Restart Pi or run `/reload` after installing or updating.
+Restart Pi or run `/reload` after installing or updating. To update the Git installation later, run `pi update --extensions`.
 
 CC Switch should be configured normally. This extension deliberately does not write Pi model settings or CC Switch data.
 
@@ -109,4 +107,3 @@ Tests use Node's built-in test runner and cover failure classification, provider
 ## License
 
 [MIT](LICENSE)
-

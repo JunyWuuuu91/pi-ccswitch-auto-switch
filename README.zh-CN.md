@@ -27,21 +27,19 @@
 
 ## 安装
 
-### macOS / Linux
+### 通过 Pi Package 安装（推荐）
 
 ```bash
-git clone https://github.com/JunyWuuuu91/pi-ccswitch-auto-switch.git \
-  ~/.pi/agent/extensions/ccswitch-auto-switch
+pi install git:github.com/JunyWuuuu91/pi-ccswitch-auto-switch
 ```
 
-### Windows PowerShell
+该命令在 macOS、Linux 和安装了 Git 的 Windows 上均可使用。npm 版本发布后，也可以执行：
 
-```powershell
-git clone https://github.com/JunyWuuuu91/pi-ccswitch-auto-switch.git `
-  "$env:USERPROFILE\.pi\agent\extensions\ccswitch-auto-switch"
+```bash
+pi install npm:pi-ccswitch-auto-switch
 ```
 
-若设置了自定义 `PI_CODING_AGENT_DIR`，请克隆到 `%PI_CODING_AGENT_DIR%/extensions/ccswitch-auto-switch`。安装或更新后重启 Pi，或执行 `/reload`。
+安装或更新后重启 Pi，或执行 `/reload`。后续更新 Git 版本可执行 `pi update --extensions`。
 
 正常使用 CC Switch 配置 Provider 即可；本插件不会修改 Pi 模型设置或 CC Switch 数据。
 
@@ -101,4 +99,3 @@ npm test
 ## 许可证
 
 [MIT](LICENSE)
-

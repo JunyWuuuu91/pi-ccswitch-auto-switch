@@ -3,6 +3,33 @@
   "version": "0.1.0",
   "description": "Provider-first automatic model failover extension for Pi and CC Switch",
   "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "ccswitch",
+    "failover",
+    "model-routing"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JunyWuuuu91/pi-ccswitch-auto-switch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JunyWuuuu91/pi-ccswitch-auto-switch/issues"
+  },
+  "homepage": "https://github.com/JunyWuuuu91/pi-ccswitch-auto-switch#readme",
+  "files": [
+    "index.ts",
+    "types.ts",
+    "classify.ts",
+    "candidates.ts",
+    "health.ts"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
   "type": "module",
   "engines": {
     "node": ">=22.19.0"
