@@ -21,6 +21,7 @@ The extension observes real Pi requests, records sanitized health signals, and�
 - Persistent, atomic, cross-process health state with error redaction and bounded logs.
 - Compact Pi status bar and interactive health panel.
 - Non-interactive `--print` / JSON runs monitor and record failures but do not inject a competing retry.
+- `pi-ccswitch-run` keeps one headless Pi RPC session alive and returns only the final successful answer after automatic model failover.
 
 ## Requirements
 
@@ -45,6 +46,18 @@ pi install npm:pi-ccswitch-auto-switch
 Restart Pi or run `/reload` after installing or updating. To update the Git installation later, run `pi update --extensions`.
 
 CC Switch should be configured normally. This extension deliberately does not write Pi model settings or CC Switch data.
+
+### Headless / automation use
+
+Install the package as an npm dependency, then run its binary (or invoke the packaged `runner.mjs` with Node):
+
+```bash
+pi-ccswitch-run --no-tools --no-context-files @prompt.md "Summarize the attached text"
+```
+
+The runner starts one `pi --mode rpc --no-session --no-extensions --extension <this package>/index.ts` process, so only CCSwitch is loaded. `PI_BIN` may point to the real Pi executable; it must not point to `pi-ccswitch-run`. The default deadline is ten minutes and can be changed with `--timeout-ms`.
+
+Exit codes are `0` for success, `1` when candidates are exhausted, `2` for invocation/RPC configuration failures, `124` for timeout, and `130`/`143` for interruption. Text `@files` are supported in the first release; images and stdin input are intentionally not.
 
 ## Commands
 
@@ -81,7 +94,7 @@ CCS ✓70/131 · ⏳61 · ⛔0 · 🔄3 · provider/model-id
 
 四个状态（健康/冷却/禁用/切换）即使为 0 也始终显示，便于确认扩展处于监控中。All-healthy still shows zero counters, e.g. `CCS ✓131/131 · ⏳0 · ⛔0 · 🔄0 · provider/model-id`. Use `/ccswitch` or `/ccswitch-test` to see Pi's raw scope entry count, the deduplicated model count, affected model counts, and the underlying breaker-record count.
 
-切换成功后扩展还会通过 `appendEntry` 向会话注入一条 `ccswitch-switch` custom entry（不参与 LLM 上下文），触发 TUI 底栏重绘——这样 Pi 右下角的模型名显示也会同步为切换后的模型。
+切换成功后扩展还会通过 `appendEntry` 向会话注入一条 `ccswitch-switch` custom entry（不参与 LLM 上下文），触发 TUI 底栏重绘——这样 Pi 右下角的模型名显示也会同步为切换后的模型。RPC 模式还会发出协议版本为 `1` 的 `ccswitch-complete` 或 `ccswitch-exhausted` 终态 entry；runner 用它们区分中间失败轮和最终结果。
 
 ## Failover behavior
 

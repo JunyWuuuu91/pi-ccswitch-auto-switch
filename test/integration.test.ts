@@ -59,6 +59,40 @@ test('provider failure moves directly to another provider rather than sibling mo
   }
 })
 
+test('RPC protocol emits switch, complete, and exhausted terminal entries', { concurrency: false }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-rpc-protocol-'))
+  const previous = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = dir
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+  const appended: Array<{ customType: string, data: Record<string, unknown> }> = []
+  const ctx: ExtensionContext = {
+    mode: 'rpc', hasUI: false, model: a, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+    modelRegistry: { refresh: async () => {}, getAvailable: () => [a, b] },
+    ui: { notify: () => {}, setStatus: () => {}, setWorkingMessage: () => {} },
+  }
+  try {
+    extension({
+      on: (name, handler) => handlers.set(name, handler), registerCommand: () => {},
+      setModel: async model => { ctx.model = model; return true }, sendUserMessage: () => {},
+      appendEntry: (customType, data) => appended.push({ customType, data }),
+    })
+    await handlers.get('session_start')?.({}, ctx)
+    handlers.get('input')?.({ source: 'rpc', text: 'retry me' }, ctx)
+    handlers.get('after_provider_response')?.({ status: 429, headers: {} }, ctx)
+    await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: a.provider, model: a.id, content: [], stopReason: 'error', errorMessage: 'rate limit' } }, ctx)
+    await handlers.get('agent_settled')?.({}, ctx)
+    await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: b.provider, model: b.id, content: [{ type: 'text', text: 'done' }], stopReason: 'stop' } }, ctx)
+    assert.deepEqual(appended.map(entry => entry.customType), ['ccswitch-switch', 'ccswitch-complete'])
+    assert.equal(appended[0].data.protocolVersion, 1)
+    assert.equal(appended[0].data.roundId, appended[1].data.roundId)
+    assert.equal(appended[1].data.model, 'provider-b/coder')
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 
 test('/new session resets the session switch counter but keeps failures and cooldowns', { concurrency: false }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'ccswitch-newsession-'))

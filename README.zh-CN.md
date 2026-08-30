@@ -19,6 +19,7 @@
 - 原子持久化状态、错误脱敏和有上限的日志。
 - Pi 紧凑状态栏与健康管理面板。
 - `--print` / JSON 非交互运行只监控和记录，不会注入可能与进程退出竞争的新请求。
+- `pi-ccswitch-run` 使用单个 Pi RPC 会话完成无头自动故障转移，只输出最终成功模型的回答。
 
 ## 要求
 
@@ -41,6 +42,16 @@ pi install npm:pi-ccswitch-auto-switch
 ```
 
 安装或更新后重启 Pi，或执行 `/reload`。后续更新 Git 版本可执行 `pi update --extensions`。
+
+### 无头自动化调用
+
+将本包作为 npm 依赖安装后，可调用：
+
+```bash
+pi-ccswitch-run --no-tools --no-context-files @prompt.md "请总结附件"
+```
+
+runner 内部只显式加载本扩展并启动一次 Pi RPC；`PI_BIN` 只能指定内部真实 `pi`，不能指向 runner。默认总超时为 10 分钟，可用 `--timeout-ms` 调整。退出码：成功 `0`、候选耗尽 `1`、参数/RPC 配置错误 `2`、超时 `124`、中断 `130/143`。首版只支持文本 `@文件`，不支持图片和 stdin。
 
 正常使用 CC Switch 配置 Provider 即可；本插件不会修改 Pi 模型设置或 CC Switch 数据。
 
@@ -71,7 +82,7 @@ CCS ✓70/131 · ⏳61 · ⛔0 · 🔄3 · provider/model-id
 
 四个状态（健康/冷却/禁用/切换）即使为 0 也始终显示，便于确认扩展处于监控中；全部健康时仍显示零计数，例如 `CCS ✓131/131 · ⏳0 · ⛔0 · 🔄0 · provider/model-id`。通过 `/ccswitch` 或 `/ccswitch-test` 可同时查看 Pi 原始 scope 条目数、去重模型数、受影响模型数、底层熔断记录数、本 session 切换数与累计切换数。
 
-切换成功后扩展还会通过 `appendEntry` 向会话注入一条 `ccswitch-switch` custom entry（不参与 LLM 上下文），触发 TUI 底栏重绘——这样 Pi 右下角的模型名显示也会同步为切换后的模型。
+切换成功后扩展还会通过 `appendEntry` 向会话注入一条 `ccswitch-switch` custom entry（不参与 LLM 上下文），触发 TUI 底栏重绘——这样 Pi 右下角的模型名显示也会同步为切换后的模型。RPC 模式还会发出协议版本为 `1` 的 `ccswitch-complete` 或 `ccswitch-exhausted` 终态 entry，供 runner 判定最终结果。
 
 ## 故障转移逻辑
 

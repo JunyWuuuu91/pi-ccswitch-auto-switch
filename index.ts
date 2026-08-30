@@ -7,6 +7,7 @@ const FIRST_RESPONSE_TIMEOUT = 90_000
 const STREAM_IDLE_TIMEOUT = 120_000
 const MAX_ATTEMPTS = 5
 const ROUND_LIMIT = 8 * 60_000
+const RPC_PROTOCOL_VERSION = 1
 // 同端点（BaseURL 相同）连续失败达到该次数即隔离该端点，避免同一个平台的多个模型逐个试错耗尽本轮切换
 const ENDPOINT_FAIL_THRESHOLD = 3
 
@@ -156,6 +157,23 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setWorkingMessage()
     await health.report(`# CCSwitch 自动故障转移失败\n\n时间：${new Date().toISOString()}\n原因：${reason}\n\n已尝试：\n${[...round.tried].map(item => `- ${item}`).join('\n')}\n\n可使用 /ccswitch status 查看状态，/ccswitch reactivate <provider/model> 重新激活。`)
     await health.log(`round exhausted: ${reason}; tried=${[...round.tried].join(',')}`)
+    // RPC runner relies on an explicit terminal signal instead of guessing from
+    // agent_settled. Keep this RPC-only so ordinary TUI transcripts stay quiet.
+    if (ctx.mode === 'rpc') {
+      const lastFailure = round.observation ? classifyFailure(round.observation).kind : undefined
+      try {
+        pi.appendEntry?.('ccswitch-exhausted', {
+          protocolVersion: RPC_PROTOCOL_VERSION,
+          roundId: round.id,
+          reason,
+          lastFailure,
+          model: key(round.model),
+          attempts: round.attempts,
+          tried: [...round.tried],
+          sessionSwitches,
+        })
+      } catch { /* reporting must not prevent the regular exhausted path */ }
+    }
     notify(ctx, `CCSwitch：自动切换停止（${reason}），请用 /ccswitch 查看详情`, 'error')
     status(ctx)
   }
@@ -223,7 +241,15 @@ export default function (pi: ExtensionAPI) {
       // interactive-mode 收到后执行 footer.invalidate() + requestRender()，footer 从 session.state.model 重新读取，
       // 从而让右下角模型名同步显示新模型（setModel 只改 state，不直接触发 footer 刷新）。
       try {
-        pi.appendEntry?.('ccswitch-switch', { from: fromKey ?? '', to: modelKey(next), reason: classification.kind, sessionSwitches })
+        pi.appendEntry?.('ccswitch-switch', {
+          protocolVersion: RPC_PROTOCOL_VERSION,
+          roundId: round.id,
+          from: fromKey ?? '',
+          to: modelKey(next),
+          reason: classification.kind,
+          attempts: round.attempts,
+          sessionSwitches,
+        })
       } catch { /* appendEntry 失败不影响切换 */ }
       const continuation = round.hadTool || round.hadOutput
         ? '请从当前会话状态继续完成上一条请求；不要重复已经完成的工具操作。'
@@ -281,6 +307,20 @@ export default function (pi: ExtensionAPI) {
     } else {
       health.recordSuccess(round.model); await health.flush()
       round.phase = 'idle'; round.observation = undefined; ctx.ui.setWorkingMessage(); status(ctx)
+      // agent_settled is also emitted after intermediate failed turns. An
+      // explicit terminal entry lets the headless RPC runner return only after
+      // this final successful assistant turn has settled.
+      if (ctx.mode === 'rpc') {
+        try {
+          pi.appendEntry?.('ccswitch-complete', {
+            protocolVersion: RPC_PROTOCOL_VERSION,
+            roundId: round.id,
+            model: key(round.model),
+            attempts: round.attempts,
+            sessionSwitches,
+          })
+        } catch { /* completion reporting is best-effort */ }
+      }
     }
   })
   pi.on('agent_settled', async (_event, ctx) => {
