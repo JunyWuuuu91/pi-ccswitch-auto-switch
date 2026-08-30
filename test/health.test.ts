@@ -87,3 +87,23 @@ test('persists learned content-policy family constraints and reset all really cl
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('clearContentPolicyConstraints removes learned families while keeping other health records', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-clear-policy-'))
+  const glm: ModelRef = { provider: 'zhipu', id: 'glm-4.5' }
+  try {
+    const store = new HealthStore(dir)
+    await store.load()
+    store.recordContentPolicyConstraint('glm', glm, 'sensitive')
+    store.recordFailure('model', 'zhipu/glm-4.5', 'endpoint', 'connection reset')
+    store.clearContentPolicyConstraints()
+    await store.flush()
+
+    const reloaded = new HealthStore(dir)
+    await reloaded.load()
+    assert.deepEqual(reloaded.snapshot.contentPolicyFamilies, {}, 'learned content policy families must not survive session restart')
+    assert.ok(reloaded.snapshot.models['zhipu/glm-4.5']?.totalFailures >= 1, 'non-policy failure records should be preserved')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})

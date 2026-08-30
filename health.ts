@@ -158,8 +158,9 @@ export class HealthStore {
   }
 
   /**
-   * 内容审查约束比限流/网络故障稳定得多，但仍设置 30 天证据有效期，避免模型策略升级后
-   * 永久污染路由。再次观察到同系列审查会增加证据计数并刷新有效期。
+   * 内容审查约束是当前 session 的观测，按 session 隔离：新 session 可能处理
+   * 不涉及审查内容的任务，因此约束在 session_start 时清除，不跨 session 继承；
+   * 本 session 内再次观察到同系列审查会增加证据计数并刷新时间戳。
    */
   recordContentPolicyConstraint(family: string, model: ModelRef, message?: string): void {
     const constraints = this.state.contentPolicyFamilies ??= {}
@@ -232,6 +233,15 @@ export class HealthStore {
       delete this.state.models[target]
       this.resetModels.add(target)
     }
+    this.touch()
+  }
+
+  /**
+   * 清除已学习的模型系列内容审查约束。新 session 可能处理不同任务，不假设
+   * 对审查内容敏感，因此不在 session 间继承审查约束。
+   */
+  clearContentPolicyConstraints(): void {
+    this.state.contentPolicyFamilies = {}
     this.touch()
   }
 

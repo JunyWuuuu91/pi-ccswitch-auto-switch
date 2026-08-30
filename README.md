@@ -13,7 +13,7 @@ The extension observes real Pi requests, records sanitized health signals, andâ€
 - Endpoint circuit breakers for DNS, connection, server, and streaming failures.
 - Endpoint platform isolation: when several models on the same endpoint (same BaseURL/provider) fail within one round, the whole endpoint is isolated so sibling models from the same platform are not tried one by one.
 - Model-only isolation for missing models and incompatible parameters.
-- Learns model-family content-policy constraints from real failures (`glm-4.5` and `GLM-4.6`, for example, are both `glm`) and avoids the entire family during current and future content-policy failover chains. Evidence expires after 30 days.
+- Learns model-family content-policy constraints from real failures (`glm-4.5` and `GLM-4.6`, for example, are both `glm`) and avoids the entire family during the current content-policy failover chain. Evidence is session-scoped: it is cleared at `session_start`, because a new session may handle tasks that are not content-sensitive, so the family becomes eligible again until this session observes its own content-policy rejection.
 - Applies hard health, failure-domain, policy-family, input-modality, and context filters before ranking candidates by provider diversity, model equivalence, capability compatibility, and historical reliability.
   - Independent-provider semantics: a copied vendor (e.g. `my-provider-copy`) shares the BaseURL but is a distinct provider with its own endpoint key, so isolating one never blocks the other.
 - 90-second first-response and 120-second streaming-idle watchdogs.
@@ -107,7 +107,7 @@ The state machine waits for Pi's native retry cycle to settle before switching. 
 | `429` | Provider | `Retry-After` when present; otherwise 5 minutes |
 | DNS, network, `408`, `5xx`, interrupted stream | Endpoint | 2 minutes |
 | `404`, invalid model, incompatible parameters | Model | 15 minutes |
-| Content-policy or sensitive-content rejection | Current model + learned model-family constraint | 2-minute model cooldown; 30-day family evidence |
+| Content-policy or sensitive-content rejection | Current model + learned model-family constraint | 2-minute model cooldown; family evidence is session-scoped (cleared at `session_start`) |
 | Context overflow | Current round only | None |
 
 Cooldowns grow exponentially within bounded limits. Learned policy-constrained families are excluded only after a content-policy rejection; they remain eligible during ordinary rate-limit, network, and model-configuration failovers. Context-overflow retries only consider models with a larger context window, and image requests do not move to a model that explicitly supports text only. Unknown errors are isolated to the current model and still fail over normally. A user cancellation is the only aborted turn that does not trigger failover; watchdog cancellations are recorded as timeouts.

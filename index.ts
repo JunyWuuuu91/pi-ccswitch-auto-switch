@@ -8,7 +8,7 @@ const STREAM_IDLE_TIMEOUT = 120_000
 const MAX_ATTEMPTS = 5
 const ROUND_LIMIT = 8 * 60_000
 const RPC_PROTOCOL_VERSION = 1
-const EXTENSION_VERSION = '0.3.1'
+const EXTENSION_VERSION = '0.3.2'
 // 同端点（BaseURL 相同）连续失败达到该次数即隔离该端点，避免同一个平台的多个模型逐个试错耗尽本轮切换
 const ENDPOINT_FAIL_THRESHOLD = 3
 
@@ -267,7 +267,16 @@ export default function (pi: ExtensionAPI) {
     await exhaust(ctx, '没有健康的候选模型')
   }
 
-  pi.on('session_start', async (_event, ctx) => { await health.load(); sessionSwitches = 0; await refresh(ctx); await health.log('extension started') })
+  pi.on('session_start', async (_event, ctx) => {
+    await health.load()
+    sessionSwitches = 0
+    // 新 session 可能处理不涉及审查内容的任务，上一 session 学到的模型系列审查约束
+    // 不跨 session 继承；若本 session 再次遇到 content_policy 失败会重新学习并在本轮避开。
+    health.clearContentPolicyConstraints()
+    await health.flush()
+    await refresh(ctx)
+    await health.log('extension started')
+  })
   pi.on('session_shutdown', async (_event, ctx) => { clearWatchdog(); ctx.ui.setWorkingMessage(); if (sessionSwitches > 0) await health.log(`session ended with ${sessionSwitches} successful switches`); await health.flush() })
   pi.on('input', (event, ctx) => {
     if (event.source === 'extension') return { action: 'continue' }
