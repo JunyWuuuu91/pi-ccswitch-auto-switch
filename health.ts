@@ -105,6 +105,8 @@ export class HealthStore {
   private dirty = false
   private replaceOnFlush = false
   private resetModels = new Set<string>()
+  /** 合并磁盘状态后仍需强制清空的审查约束（session 边界） */
+  private clearContentPolicyOnFlush = false
 
   constructor(dir = agentDir()) { this.dir = dir }
   get file(): string { return join(this.dir, STATE_FILE) }
@@ -242,6 +244,7 @@ export class HealthStore {
    */
   clearContentPolicyConstraints(): void {
     this.state.contentPolicyFamilies = {}
+    this.clearContentPolicyOnFlush = true
     this.touch()
   }
 
@@ -270,6 +273,8 @@ export class HealthStore {
     await this.withLock(async () => {
       if (!this.replaceOnFlush) this.state = mergeState(await this.readDisk(), this.state)
       for (const key of this.resetModels) delete this.state.models[key]
+      // 必须在 merge 之后再清空：磁盘上残留的旧 session 约束不能因合并而重新出现
+      if (this.clearContentPolicyOnFlush) this.state.contentPolicyFamilies = {}
       await this.commit()
     }).catch(() => {})
   }
@@ -308,6 +313,7 @@ export class HealthStore {
     this.dirty = false
     this.replaceOnFlush = false
     this.resetModels.clear()
+    this.clearContentPolicyOnFlush = false
   }
   private bucket(scope: HealthScope): Record<string, HealthRecord> {
     return scope === 'model' ? this.state.models : scope === 'provider' ? this.state.providers : this.state.endpoints

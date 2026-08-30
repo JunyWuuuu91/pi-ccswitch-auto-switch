@@ -92,13 +92,21 @@ test('clearContentPolicyConstraints removes learned families while keeping other
   const dir = await mkdtemp(join(tmpdir(), 'ccswitch-clear-policy-'))
   const glm: ModelRef = { provider: 'zhipu', id: 'glm-4.5' }
   try {
+    // 上一个 session：约束和普通故障都先落盘
+    const previous = new HealthStore(dir)
+    await previous.load()
+    previous.recordContentPolicyConstraint('glm', glm, 'sensitive')
+    previous.recordFailure('model', 'zhipu/glm-4.5', 'endpoint', 'connection reset')
+    await previous.flush()
+
+    // 新 session：load 到旧约束 → clear → flush（真实 session 边界场景）
     const store = new HealthStore(dir)
     await store.load()
-    store.recordContentPolicyConstraint('glm', glm, 'sensitive')
-    store.recordFailure('model', 'zhipu/glm-4.5', 'endpoint', 'connection reset')
+    assert.ok(store.snapshot.contentPolicyFamilies?.glm, 'new session should see the previously persisted constraint before clearing')
     store.clearContentPolicyConstraints()
     await store.flush()
 
+    // 再次从磁盘读，确认约束确实被清掉，而不是被 merge 逻辑重新带回来
     const reloaded = new HealthStore(dir)
     await reloaded.load()
     assert.deepEqual(reloaded.snapshot.contentPolicyFamilies, {}, 'learned content policy families must not survive session restart')
