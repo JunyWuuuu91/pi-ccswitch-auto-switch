@@ -72,8 +72,8 @@ export default function (pi: ExtensionAPI) {
     const theme = ctx.ui.theme
     ctx.ui.setStatus('ccswitch-ha', theme ? theme.fg(counts.cooling || counts.disabled ? 'warning' : 'success', plain) : plain)
   }
-  // 本次 session 成功切换计数：⇄N（N>0 时显示）；累计切换数在面板/自检中可见
-  const switchSuffix = () => sessionSwitches > 0 ? ` · ⇄${sessionSwitches}` : ''
+  // 本次 session 成功切换计数：始终显示 ⇄N（N=0 也显示，用于确认扩展在监控中）；累计切换数在面板/自检中可见
+  const switchSuffix = () => ` · ⇄${sessionSwitches}`
   const notify = (ctx: ExtensionContext, message: string, type: 'info' | 'warning' | 'error' = 'info') => {
     if (ctx.hasUI) ctx.ui.notify(message, type)
   }
