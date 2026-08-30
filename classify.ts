@@ -17,7 +17,9 @@ export function classifyFailure(observation: FailureObservation): Classification
   const status = observation.status
   if (observation.aborted && !observation.watchdog) return { kind: 'unknown', roundOnly: true }
   if (observation.watchdog) return { kind: 'timeout', scope: 'endpoint', roundOnly: false }
-  if (content.test(text)) return { kind: 'content_policy', roundOnly: true }
+  // 内容审查/敏感拦截属于该模型的失败：按 model 级记录并与冷却（2min×2ⁿ 上限 30min），
+  // chooseCandidate 会排除后自动切换到其他模型，而不是同一内容原样重试到本轮上限。
+  if (content.test(text)) return { kind: 'content_policy', scope: 'model', roundOnly: false }
   if (context.test(text)) return { kind: 'context_overflow', roundOnly: true }
   if (status === 429) return { kind: 'rate_limit', scope: 'provider', roundOnly: false, retryAfterMs: observation.retryAfterMs }
   if (status === 401 || status === 403) return { kind: 'auth', scope: 'provider', roundOnly: false }

@@ -32,6 +32,8 @@ interface Round {
   observation?: FailureObservation
   model?: ModelRef
   endpointFails?: EndpointFailTracker
+  /** 本轮内最后一次成功切换的时间；用于刷新 ROUND_LIMIT 窗口，避免供应商内部重试耗时导致误判“达到上限” */
+  lastSwitchAt?: number
 }
 
 function key(model: ModelRef | undefined): string | undefined { return model && modelKey(model) }
@@ -69,9 +71,11 @@ export default function (pi: ExtensionAPI) {
     const activeModel = round?.model ?? ctx.model
     // 恒显完整状态：健康/总数 · 冷却 · 禁用 · 本session切换 · 当前模型（均为 0 时也显示，便于确认扩展在监控中）
     const plain = round?.phase === 'switching' ? `CCS ↻${round.attempts}/${MAX_ATTEMPTS} ${modelTag(round.model)}` :
+      round?.phase === 'exhausted' ? `CCS ⏸切换停止 ${modelTag(round.model ?? ctx.model)}` :
       `CCS ✓${counts.healthy}/${counts.total} · ⏳${counts.cooling} · ⛔${counts.disabled}${switchSuffix()} · ${modelTag(activeModel)}`
     const theme = ctx.ui.theme
-    ctx.ui.setStatus('ccswitch-ha', theme ? theme.fg(counts.cooling || counts.disabled ? 'warning' : 'success', plain) : plain)
+    const tone = round?.phase === 'exhausted' ? 'error' : counts.cooling || counts.disabled ? 'warning' : 'success'
+    ctx.ui.setStatus('ccswitch-ha', theme ? theme.fg(tone, plain) : plain)
   }
   // 本次 session 成功切换计数：始终显示 🔄N（N=0 也显示，用于确认扩展在监控中）；累计切换数在面板/自检中可见
   const switchSuffix = () => ` · 🔄${sessionSwitches}`
@@ -140,7 +144,9 @@ export default function (pi: ExtensionAPI) {
   }
   const failover = async (ctx: ExtensionContext) => {
     if (!round || !round.observation || !round.model || !canRetry(ctx)) return
-    if (round.attempts >= MAX_ATTEMPTS || Date.now() - round.startedAt >= ROUND_LIMIT) return exhaust(ctx, '达到本轮切换上限')
+    // 窗口从上一次成功切换（或本轮开始）起算：供应商内部重试耗时不应消耗整轮限额
+    const windowStart = Math.max(round.startedAt, round.lastSwitchAt ?? 0)
+    if (round.attempts >= MAX_ATTEMPTS || Date.now() - windowStart >= ROUND_LIMIT) return exhaust(ctx, '达到本轮切换上限')
     const classification = classifyFailure(round.observation)
     if (round.observation.aborted && !round.observation.watchdog) { round.phase = 'idle'; clearWatchdog(); status(ctx); return }
     round.phase = 'switching'
@@ -173,6 +179,8 @@ export default function (pi: ExtensionAPI) {
       }
       round.model = next
       round.phase = 'redispatching'
+      // 刷新本轮切换时间窗：成功切换后重新起算 ROUND_LIMIT，避免长重试轮被误判为“达到上限”
+      round.lastSwitchAt = Date.now()
       // 本次 session 成功切换计数 + 持久化累计/日志（衡量扩展有效程度）
       sessionSwitches += 1
       const fromKey = key(round.model ?? ctx.model)

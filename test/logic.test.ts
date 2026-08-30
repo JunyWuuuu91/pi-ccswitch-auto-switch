@@ -18,9 +18,14 @@ test('classifies provider-wide failures before model failures', () => {
   assert.deepEqual(classifyFailure({ status: 404, message: 'model not found' }).scope, 'model')
 })
 
-test('does not poison global health for content or context failures', () => {
-  assert.equal(classifyFailure({ message: 'content_filter' }).roundOnly, true)
+test('does not poison global health for context failures; content policy flags the model for switch', () => {
+  // context overflow 是内容本身超长：roundOnly，切换模型无益（且 chooseCandidate 有更大上下文过滤）
   assert.equal(classifyFailure({ message: 'context window exceeded' }).roundOnly, true)
+  // 内容审查/敏感拦截是按模型的失败：应记台账、冷却并触发切换，而不是原样重试
+  assert.deepEqual(classifyFailure({ message: 'content_filter' }), {
+    kind: 'content_policy', scope: 'model', roundOnly: false,
+  })
+  assert.deepEqual(classifyFailure({ message: 'Provider finish_reason: sensitive' }).scope, 'model')
 })
 
 test('prefers the same model on another provider over another local model', () => {

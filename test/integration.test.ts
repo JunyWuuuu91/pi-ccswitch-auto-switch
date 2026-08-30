@@ -120,3 +120,75 @@ test('/new session resets the session switch counter but keeps failures and cool
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('content_policy failure switches to another model and records health', { concurrency: false }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-contentpolicy-'))
+  const previous = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = dir
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+  const selected: string[] = []
+  let activeModel: ModelRef = a
+  const ctx: ExtensionContext = {
+    mode: 'tui', hasUI: true, model: a, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+    modelRegistry: { refresh: async () => {}, getAvailable: () => [a, b] },
+    ui: { notify: () => {}, setStatus: () => {}, setWorkingMessage: () => {} },
+  }
+  try {
+    extension({
+      on: (name, handler) => handlers.set(name, handler),
+      registerCommand: () => {},
+      setModel: async model => { activeModel = model; ctx.model = model; selected.push(`${model.provider}/${model.id}`); return true },
+      sendUserMessage: () => {},
+    })
+    await handlers.get('session_start')?.({}, ctx)
+    handlers.get('input')?.({ source: 'interactive', text: 'ask something' }, ctx)
+    handlers.get('after_provider_response')?.({ status: 200, headers: {} }, ctx)
+    // sensitive 内容审查：应视为模型失败并切换到 provider-b，而不是原样重试
+    await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: 'provider-a', model: 'coder', content: [], stopReason: 'error', errorMessage: 'Provider finish_reason: sensitive' } }, ctx)
+    await handlers.get('agent_settled')?.({}, ctx)
+    assert.deepEqual(selected, ['provider-b/coder'], 'content policy should trigger a switch')
+    // 台账应记录 model 级失败（冷却）
+    const state = JSON.parse(readFileSync(join(dir, 'ccswitch-auto-switch-state.json'), 'utf8'))
+    assert.ok(state.models['provider-a/coder']?.cooldownUntil > Date.now(), 'model should be cooling after content policy failure')
+    assert.equal(state.switches, 1)
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('exhausted phase renders stop indicator in the status bar', { concurrency: false }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-exhausted-'))
+  const previous = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = dir
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+  let activeModel: ModelRef = a
+  const statuses: string[] = []
+  const ctx: ExtensionContext = {
+    mode: 'tui', hasUI: true, model: a, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+    modelRegistry: { refresh: async () => {}, getAvailable: () => [a] },
+    ui: { notify: () => {}, setStatus: (_key, text) => { if (text) statuses.push(text) }, setWorkingMessage: () => {} },
+  }
+  try {
+    extension({
+      on: (name, handler) => handlers.set(name, handler),
+      registerCommand: () => {},
+      setModel: async model => { activeModel = model; ctx.model = model; return true },
+      sendUserMessage: () => {},
+    })
+    await handlers.get('session_start')?.({}, ctx)
+    handlers.get('input')?.({ source: 'interactive', text: 'trigger round' }, ctx)
+    handlers.get('after_provider_response')?.({ status: 429, headers: {} }, ctx)
+    // 唯一候选也已冷却 → agent_settled 时 failover 无候选 → exhaust
+    await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: 'provider-a', model: 'coder', content: [], stopReason: 'error', errorMessage: 'rate limit' } }, ctx)
+    await handlers.get('agent_settled')?.({}, ctx)
+    const last = statuses[statuses.length - 1] ?? ''
+    assert.match(last, /停止/, 'exhausted phase should render a stop indicator')
+    assert.match(last, /provider-a\/coder/, 'stop indicator should carry the last active model')
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})
