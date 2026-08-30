@@ -89,11 +89,11 @@ test('still selects a sibling on the same endpoint when it is not isolated', () 
 })
 
 test('same baseURL on different providers are independent endpoints (copy-vendor semantics)', () => {
-  // b-ai 与复制的 b-ai-copy 共享 baseURL，但必须视为独立端点，互不连坐
-  const bai: ModelRef = { provider: 'b-ai', id: 'deepseek-v4-flash', baseUrl: 'https://api.b.ai/v1', contextWindow: 128000 }
-  const baiCopy: ModelRef = { provider: 'b-ai-copy', id: 'deepseek-v4-flash', baseUrl: 'https://api.b.ai/v1', contextWindow: 128000 }
+  // vendor-copy 与复制品共享 baseURL，但必须视为独立端点，互不连坐
+  const bai: ModelRef = { provider: 'my-provider', id: 'model-a', baseUrl: 'https://api.example.com/v1', contextWindow: 128000 }
+  const baiCopy: ModelRef = { provider: 'my-provider-copy', id: 'model-a', baseUrl: 'https://api.example.com/v1', contextWindow: 128000 }
   assert.notEqual(endpointKey(bai), endpointKey(baiCopy))
-  // 隔离 b-ai 端点后，b-ai-copy 仍是健康候选
-  const next = chooseCandidate([bai, baiCopy], { current: bai, tried: new Set(['b-ai/deepseek-v4-flash']), health, avoidEndpoints: new Set([endpointKey(bai)]) })
-  assert.equal(next?.provider, 'b-ai-copy')
+  // 隔离 my-provider 端点后，my-provider-copy 仍是健康候选
+  const next = chooseCandidate([bai, baiCopy], { current: bai, tried: new Set(['my-provider/model-a']), health, avoidEndpoints: new Set([endpointKey(bai)]) })
+  assert.equal(next?.provider, 'my-provider-copy')
 })
