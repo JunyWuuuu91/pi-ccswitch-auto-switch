@@ -42,6 +42,8 @@ export default function (pi: ExtensionAPI) {
   let round: Round | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
   let lastStatus: { status?: number, retryAfterMs?: number } = {}
+  // 本次 pi session 内成功切换的模型数量（用于衡量插件的有效程度）
+  let sessionSwitches = 0
 
   const clearWatchdog = () => { if (timer) clearTimeout(timer); timer = undefined }
   const armWatchdog = (ctx: ExtensionContext, ms: number, roundId: number) => {
@@ -54,15 +56,24 @@ export default function (pi: ExtensionAPI) {
     }, ms)
     timer.unref?.()
   }
+  // 当前生效模型名（provider/id）；过长时压缩，避免撑爆状态栏
+  const modelTag = (model: ModelRef | undefined) => {
+    if (!model) return ''
+    const full = modelKey(model)
+    return full.length > 30 ? `${model.provider}/${model.id?.slice(0, 24)}…` : full
+  }
   const status = (ctx: ExtensionContext) => {
     const state = health.snapshot
     const { models } = candidateSnapshot(ctx.scopedModels, ctx.modelRegistry.getAvailable())
     const counts = summarizeCandidateHealth(models, state)
-    const plain = round?.phase === 'switching' ? `CCS ↻${round.attempts}/${MAX_ATTEMPTS} ${round.model ? modelKey(round.model) : ''}` :
-      counts.cooling || counts.disabled ? `CCS ✓${counts.healthy}/${counts.total} · ⏳${counts.cooling} · ⛔${counts.disabled}` : `CCS ✓${counts.total}`
+    const activeModel = round?.model ?? ctx.model
+    const plain = round?.phase === 'switching' ? `CCS ↻${round.attempts}/${MAX_ATTEMPTS} ${modelTag(round.model)}` :
+      counts.cooling || counts.disabled ? `CCS ✓${counts.healthy}/${counts.total} · ⏳${counts.cooling} · ⛔${counts.disabled}${switchSuffix()} · ${modelTag(activeModel)}` : `CCS ✓${counts.total}${switchSuffix()} · ${modelTag(activeModel)}`
     const theme = ctx.ui.theme
     ctx.ui.setStatus('ccswitch-ha', theme ? theme.fg(counts.cooling || counts.disabled ? 'warning' : 'success', plain) : plain)
   }
+  // 本次 session 成功切换计数：⇄N（N>0 时显示）；累计切换数在面板/自检中可见
+  const switchSuffix = () => sessionSwitches > 0 ? ` · ⇄${sessionSwitches}` : ''
   const notify = (ctx: ExtensionContext, message: string, type: 'info' | 'warning' | 'error' = 'info') => {
     if (ctx.hasUI) ctx.ui.notify(message, type)
   }
@@ -97,11 +108,17 @@ export default function (pi: ExtensionAPI) {
     })
     if (!ctx.ui.select) {
       const source = snapshot.source === 'scoped' ? `Pi scope ${snapshot.sourceEntries} 条` : `Pi 注册表 ${snapshot.sourceEntries} 条`
-      notify(ctx, `CCSwitch：${source} · 唯一模型 ${counts.total} · 健康 ${counts.healthy} · 自动冷却 ${counts.cooling} · 手动禁用 ${counts.disabled}`, 'info')
+      notify(ctx, `CCSwitch：${source} · 唯一模型 ${counts.total} · 健康 ${counts.healthy} · 自动冷却 ${counts.cooling} · 手动禁用 ${counts.disabled} · 本session切换 ${sessionSwitches} · 累计切换 ${state.switches ?? 0}`, 'info')
       return
     }
     const scopeLabel = snapshot.source === 'scoped' ? `Pi scope：${snapshot.sourceEntries} 条` : `Pi 可用注册表：${snapshot.sourceEntries} 条`
-    const action = await ctx.ui.select(`CCSwitch 健康面板\n当前：${key(ctx.model) ?? '无'}\n${scopeLabel} · 唯一模型：${counts.total} · 健康：${counts.healthy} · 自动冷却：${counts.cooling} · 手动禁用：${counts.disabled}\n熔断记录：${counts.breakerRecords}\n${rows.join('\n') || '没有可用模型'}`, ['刷新', '重新激活当前模型', '禁用当前模型', '重置当前模型历史', '关闭'])
+    const switchSummary = `本session切换：${sessionSwitches} · 累计切换：${state.switches ?? 0}`
+    const recentSwitches = (state.switchLog ?? []).slice(0, 5).map(entry => {
+      const time = new Date(entry.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      return `  ${time} ${entry.from} ⇄ ${entry.to}`
+    })
+    const switchPanel = recentSwitches.length ? `\n最近切换：\n${recentSwitches.join('\n')}` : ''
+    const action = await ctx.ui.select(`CCSwitch 健康面板\n当前：${key(ctx.model) ?? '无'}\n${scopeLabel} · 唯一模型：${counts.total} · 健康：${counts.healthy} · 自动冷却：${counts.cooling} · 手动禁用：${counts.disabled}\n熔断记录：${counts.breakerRecords}\n${switchSummary}${switchPanel}\n${rows.join('\n') || '没有可用模型'}`, ['刷新', '重新激活当前模型', '禁用当前模型', '重置当前模型历史', '关闭'])
     if (action === '刷新') await refresh(ctx)
     if (action === '重新激活当前模型' && ctx.model) { health.reactivate(ctx.model); await health.flush(); status(ctx); notify(ctx, '已重新激活当前模型') }
     if (action === '禁用当前模型' && ctx.model) { health.disable(modelKey(ctx.model), true); await health.flush(); status(ctx); notify(ctx, '已禁用当前模型', 'warning') }
@@ -155,7 +172,18 @@ export default function (pi: ExtensionAPI) {
       }
       round.model = next
       round.phase = 'redispatching'
+      // 本次 session 成功切换计数 + 持久化累计/日志（衡量扩展有效程度）
+      sessionSwitches += 1
+      const fromKey = key(round.model ?? ctx.model)
+      health.recordSwitch(fromKey ?? '', modelKey(next), classification.kind)
+      await health.flush()
       notify(ctx, `CCSwitch：已切换至 ${modelKey(next)}（${round.attempts}/${MAX_ATTEMPTS}）`, 'info')
+      // 触发 TUI 底栏/界面重绘：appendEntry 会发出 entry_appended 事件进入 session.subscribe 流，
+      // interactive-mode 收到后执行 footer.invalidate() + requestRender()，footer 从 session.state.model 重新读取，
+      // 从而让右下角模型名同步显示新模型（setModel 只改 state，不直接触发 footer 刷新）。
+      try {
+        pi.appendEntry?.('ccswitch-switch', { from: fromKey ?? '', to: modelKey(next), reason: classification.kind, sessionSwitches })
+      } catch { /* appendEntry 失败不影响切换 */ }
       const continuation = round.hadTool || round.hadOutput
         ? '请从当前会话状态继续完成上一条请求；不要重复已经完成的工具操作。'
         : round.images?.length ? [{ type: 'text', text: round.text }, ...round.images] : round.text
@@ -170,8 +198,8 @@ export default function (pi: ExtensionAPI) {
     await exhaust(ctx, '没有健康的候选模型')
   }
 
-  pi.on('session_start', async (_event, ctx) => { await health.load(); await refresh(ctx); await health.log('extension started') })
-  pi.on('session_shutdown', async (_event, ctx) => { clearWatchdog(); ctx.ui.setWorkingMessage(); await health.flush() })
+  pi.on('session_start', async (_event, ctx) => { await health.load(); sessionSwitches = 0; await refresh(ctx); await health.log('extension started') })
+  pi.on('session_shutdown', async (_event, ctx) => { clearWatchdog(); ctx.ui.setWorkingMessage(); if (sessionSwitches > 0) await health.log(`session ended with ${sessionSwitches} successful switches`); await health.flush() })
   pi.on('input', (event, ctx) => {
     if (event.source === 'extension') return { action: 'continue' }
     clearWatchdog()
@@ -255,7 +283,8 @@ export default function (pi: ExtensionAPI) {
     await refresh(ctx)
     const snapshot = candidateSnapshot(ctx.scopedModels, ctx.modelRegistry.getAvailable())
     const counts = summarizeCandidateHealth(snapshot.models, health.snapshot)
+    const state = health.snapshot
     const source = snapshot.source === 'scoped' ? `Pi scope ${snapshot.sourceEntries} 条` : `Pi 注册表 ${snapshot.sourceEntries} 条`
-    notify(ctx, `CCSwitch 自检：${source} · 唯一模型 ${counts.total} · 健康 ${counts.healthy} · 自动冷却 ${counts.cooling} · 手动禁用 ${counts.disabled} · 熔断记录 ${counts.breakerRecords}`, counts.total ? 'info' : 'warning')
+    notify(ctx, `CCSwitch 自检：${source} · 唯一模型 ${counts.total} · 健康 ${counts.healthy} · 自动冷却 ${counts.cooling} · 手动禁用 ${counts.disabled} · 熔断记录 ${counts.breakerRecords} · 本session切换 ${sessionSwitches} · 累计切换 ${state.switches ?? 0}`, counts.total ? 'info' : 'warning')
   }})
 }

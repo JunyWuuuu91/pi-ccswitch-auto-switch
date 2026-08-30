@@ -44,6 +44,12 @@ export interface ExtensionAPI {
     handler: (args: string, ctx: ExtensionContext) => Promise<void> | void
   }): void
   sendUserMessage(content: string | Array<Record<string, unknown>>): void
+  /**
+   * 追加一条不参与 LLM 上下文的 custom entry。
+   * appendEntry 会向 session.subscribe 流发出 entry_appended 事件，
+   * 从而触发 TUI footer/界面重绘——用于切换模型后强制底栏同步显示新模型名。
+   */
+  appendEntry?(customType: string, data: Record<string, unknown>): void
   setModel(model: ModelRef): Promise<boolean>
   setThinkingLevel?(level: string): void
 }

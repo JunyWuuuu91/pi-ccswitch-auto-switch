@@ -68,15 +68,19 @@ Examples:
 ## Status bar
 
 ```text
-CCS ✓70/131 · ⏳61 · ⛔0
+CCS ✓70/131 · ⏳61 · ⛔0 · ⇄3 · b-ai/deepseek-v4-flash
 ```
 
 - `✓70/131`: 70 healthy models out of 131 unique `provider/model` combinations in Pi's effective scope. Duplicate scoped entries are counted once.
 - `⏳61`: 61 models are currently affected by automatic model, provider, or endpoint cooldowns. One provider breaker can account for many affected models.
 - `⛔0`: no manually disabled models.
+- `⇄3`: **本次 pi session 成功切换的模型次数**（衡量扩展有效程度）。`/new`、`/fork`、`/resume` 等新 session 开始时归零；但**失败记录与冷却状态不重置**（它们是物理事实，跨 session 保留）。累计切换数（`state.switches`）与最近 20 条切换日志会持久化到状态文件，可在 `/ccswitch` 面板和 `/ccswitch-test` 中查看。
+- `b-ai/deepseek-v4-flash`: 当前实际生效的模型（`provider/id`，切换后立即更新，长名自动截断）。
 - During a switch, `CCS ↻2/5 provider/model` means the second of at most five attempts is being made.
 
-When all unique models are healthy, the compact form is `CCS ✓131`. Use `/ccswitch` or `/ccswitch-test` to see Pi's raw scope entry count, the deduplicated model count, affected model counts, and the underlying breaker-record count.
+When all unique models are healthy, the compact form is `CCS ✓131 · b-ai/deepseek-v4-flash`. Use `/ccswitch` or `/ccswitch-test` to see Pi's raw scope entry count, the deduplicated model count, affected model counts, and the underlying breaker-record count.
+
+切换成功后扩展还会通过 `appendEntry` 向会话注入一条 `ccswitch-switch` custom entry（不参与 LLM 上下文），触发 TUI 底栏重绘——这样 Pi 右下角的模型名显示也会同步为切换后的模型。
 
 ## Failover behavior
 

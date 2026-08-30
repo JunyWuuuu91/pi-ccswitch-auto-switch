@@ -30,6 +30,15 @@ export interface HealthState {
   models: Record<string, HealthRecord>
   providers: Record<string, HealthRecord>
   endpoints: Record<string, HealthRecord>
+  /** 累计成功切换次数（跨 session 持久化，用于衡量扩展有效程度） */
+  switches?: number
+  /** 最近成功切换日志（有限条，环形保留） */
+  switchLog?: Array<{
+    at: number
+    from: string
+    to: string
+    reason?: string
+  }>
 }
 
 export function agentDir(env = process.env, home = homedir()): string {
@@ -55,7 +64,7 @@ function safeEndpoint(value: string): string {
 }
 
 function blank(): HealthState {
-  return { schemaVersion: 2, updatedAt: Date.now(), models: {}, providers: {}, endpoints: {} }
+  return { schemaVersion: 2, updatedAt: Date.now(), models: {}, providers: {}, endpoints: {}, switches: 0, switchLog: [] }
 }
 
 function redact(text: string | undefined): string | undefined {
@@ -138,6 +147,18 @@ export class HealthStore {
     this.close('model', modelKey(model))
     this.close('provider', model.provider)
     this.close('endpoint', endpointKey(model))
+    this.touch()
+  }
+
+  /**
+   * 记录一次成功的模型切换：累计计数 + 环形保留最近 20 条切换日志。
+   * 用于衡量扩展有效程度，并在 /ccswitch status 面板展示。
+   */
+  recordSwitch(from: string, to: string, reason?: string): void {
+    this.state.switches = (this.state.switches ?? 0) + 1
+    const log = this.state.switchLog ?? []
+    log.push({ at: Date.now(), from, to, reason })
+    this.state.switchLog = log.slice(-20)
     this.touch()
   }
 
@@ -287,5 +308,11 @@ function mergeBucket(a: Record<string, HealthRecord>, b: Record<string, HealthRe
 }
 
 function mergeState(a: HealthState, b: HealthState): HealthState {
-  return { schemaVersion: 2, updatedAt: Math.max(a.updatedAt ?? 0, b.updatedAt ?? 0), models: mergeBucket(a.models ?? {}, b.models ?? {}), providers: mergeBucket(a.providers ?? {}, b.providers ?? {}), endpoints: mergeBucket(a.endpoints ?? {}, b.endpoints ?? {}) }
+  const switches = Math.max(a.switches ?? 0, b.switches ?? 0)
+  // 取最近更新的 switchLog（按 at 去倒序合并，保留最新 20 条）
+  const log = [...(a.switchLog ?? []), ...(b.switchLog ?? [])]
+    .sort((x, y) => y.at - x.at)
+    .filter((entry, index, all) => index === 0 || all[index - 1].at !== entry.at || all[index - 1].from !== entry.from || all[index - 1].to !== entry.to)
+    .slice(0, 20)
+  return { schemaVersion: 2, updatedAt: Math.max(a.updatedAt ?? 0, b.updatedAt ?? 0), models: mergeBucket(a.models ?? {}, b.models ?? {}), providers: mergeBucket(a.providers ?? {}, b.providers ?? {}), endpoints: mergeBucket(a.endpoints ?? {}, b.endpoints ?? {}), switches, switchLog: log }
 }
