@@ -70,9 +70,10 @@ runner 内部只显式加载本扩展并启动一次 Pi RPC；`PI_BIN` 只能指
 ## 状态栏
 
 ```text
-CCS ✓70/131 · ⏳61 · ⛔0 · 🔄3 · provider/model-id
+CCS v0.3.1 ✓70/131 · ⏳61 · ⛔0 · 🔄3 · provider/model-id
 ```
 
+- `v0.3.1`：当前安装的 CCSwitch 扩展版本。
 - `✓70/131`：Pi 有效范围内共有 131 个去重后的 `provider/model` 组合，其中 70 个健康；重复的 scope 条目只计一次。
 - `⏳61`：有 61 个模型正受模型、Provider 或端点自动冷却影响；一条 Provider 熔断记录可能同时影响许多模型。
 - `⛔0`：没有被手动禁用的模型。

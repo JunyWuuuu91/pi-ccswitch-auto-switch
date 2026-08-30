@@ -8,6 +8,7 @@ const STREAM_IDLE_TIMEOUT = 120_000
 const MAX_ATTEMPTS = 5
 const ROUND_LIMIT = 8 * 60_000
 const RPC_PROTOCOL_VERSION = 1
+const EXTENSION_VERSION = '0.3.1'
 // 同端点（BaseURL 相同）连续失败达到该次数即隔离该端点，避免同一个平台的多个模型逐个试错耗尽本轮切换
 const ENDPOINT_FAIL_THRESHOLD = 3
 
@@ -84,9 +85,10 @@ export default function (pi: ExtensionAPI) {
     const counts = summarizeCandidateHealth(models, state)
     const activeModel = round?.model ?? ctx.model
     // 恒显完整状态：健康/总数 · 冷却 · 禁用 · 本session切换 · 当前模型（均为 0 时也显示，便于确认扩展在监控中）
-    const plain = round?.phase === 'switching' ? `CCS ↻${round.attempts}/${MAX_ATTEMPTS} ${modelTag(round.model)}` :
-      round?.phase === 'exhausted' ? `CCS ⏸切换停止 ${modelTag(round.model ?? ctx.model)}` :
-      `CCS ✓${counts.healthy}/${counts.total} · ⏳${counts.cooling} · ⛔${counts.disabled}${switchSuffix()} · ${modelTag(activeModel)}`
+    const prefix = `CCS v${EXTENSION_VERSION}`
+    const plain = round?.phase === 'switching' ? `${prefix} ↻${round.attempts}/${MAX_ATTEMPTS} ${modelTag(round.model)}` :
+      round?.phase === 'exhausted' ? `${prefix} ⏸切换停止 ${modelTag(round.model ?? ctx.model)}` :
+      `${prefix} ✓${counts.healthy}/${counts.total} · ⏳${counts.cooling} · ⛔${counts.disabled}${switchSuffix()} · ${modelTag(activeModel)}`
     const theme = ctx.ui.theme
     const tone = round?.phase === 'exhausted' ? 'error' : counts.cooling || counts.disabled ? 'warning' : 'success'
     ctx.ui.setStatus('ccswitch-ha', theme ? theme.fg(tone, plain) : plain)

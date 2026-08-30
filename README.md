@@ -82,9 +82,10 @@ Examples:
 ## Status bar
 
 ```text
-CCS ✓70/131 · ⏳61 · ⛔0 · 🔄3 · provider/model-id
+CCS v0.3.1 ✓70/131 · ⏳61 · ⛔0 · 🔄3 · provider/model-id
 ```
 
+- `v0.3.1`: the installed CCSwitch extension version.
 - `✓70/131`: 70 healthy models out of 131 unique `provider/model` combinations in Pi's effective scope. Duplicate scoped entries are counted once.
 - `⏳61`: 61 models are currently affected by automatic model, provider, or endpoint cooldowns. One provider breaker can account for many affected models.
 - `⛔0`: no manually disabled models.
