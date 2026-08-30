@@ -45,7 +45,32 @@ pi install npm:pi-ccswitch-auto-switch
 
 ### 无头自动化调用
 
-将本包作为 npm 依赖安装后，可调用：
+`pi-ccswitch-run`（`runner.mjs`）是独立于 Pi 扩展的 headless 调用入口：它启动一个 `pi --mode rpc` 会话，把一次请求自动切换到健康模型后只返回最终成功结果。它**不在** `pi install` 的扩展加载路径里自动暴露给下游项目，需要单独安装。
+
+#### 在消费方项目内安装（推荐，保证 `require.resolve` 可解析）
+
+`pi install git:...` 只把扩展装进 Pi 全局目录（`~/.pi/agent/...`），**不会**把它放进下游项目的 `node_modules` 解析路径。因此消费方代码里 `require.resolve('pi-ccswitch-auto-switch/runner.mjs')` 需要把本包安装进**自己的项目依赖**：
+
+```bash
+# 在消费方项目目录内执行
+npm i github:JunyWuuuu91/pi-ccswitch-auto-switch
+# 或从 npm registry 安装最新版
+npm i pi-ccswitch-auto-switch@latest
+```
+
+安装后 `require.resolve('pi-ccswitch-auto-switch/runner.mjs')` 会命中项目自身 `node_modules`，bin `pi-ccswitch-run` 也可直接调用。
+
+#### 版本锁定警告（0.x caret 陷阱）
+
+npm 对 `^0.1.6` 的 caret 语义**只匹配 `0.1.x`**，不会自动升到含 `runner.mjs` 的 `0.3.x`。如果机器上 `~/.pi/agent/npm/node_modules/pi-ccswitch-auto-switch` 仍停留在 `0.1.6`（该版本无 `runner.mjs`、无 `pi-ccswitch-run` bin），重复执行 `pi install` 也不会升级。请手动升级 npm 侧版本：
+
+```bash
+cd ~/.pi/agent/npm && npm install pi-ccswitch-auto-switch@latest
+```
+
+升级后确认 `~/.pi/agent/npm/node_modules/pi-ccswitch-auto-switch/runner.mjs` 存在。也可以在扩展内执行 `/ccswitch-doctor` 检查 `runner.mjs` 是否可解析。
+
+#### 运行方式
 
 ```bash
 pi-ccswitch-run --no-tools --no-context-files @prompt.md "请总结附件"
@@ -66,6 +91,7 @@ runner 内部只显式加载本扩展并启动一次 Pi RPC；`PI_BIN` 只能指
 | `/ccswitch disable <provider/model>` | 手动排除模型。 |
 | `/ccswitch reset <provider/model\|all>` | 确认后删除相应健康历史；`all` 同时清除已学习的审查约束。 |
 | `/ccswitch-test` | 仅检查候选发现，不切换模型。 |
+| `/ccswitch-doctor` | 诊断 `runner.mjs` 可解析性和安装情况。 |
 
 ## 状态栏
 

@@ -1,3 +1,8 @@
+import { existsSync, readFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { ExtensionAPI, ExtensionContext, FailureObservation, ModelRef } from './types.ts'
 import { classifyFailure, parseRetryAfter } from './classify.ts'
 import { candidateSnapshot, effectiveCandidates, chooseCandidate, modelFamily, summarizeCandidateHealth } from './candidates.ts'
@@ -108,6 +113,7 @@ export default function (pi: ExtensionAPI) {
       '/ccswitch disable <provider/model> — 手动禁用模型',
       '/ccswitch reset <provider/model|all> — 清除健康历史；all 也会清除已学习的审查约束（需确认）',
       '/ccswitch-test — 自检候选模型，不实际切换',
+      '/ccswitch-doctor — 诊断 runner.mjs 可解析性和安装情况',
     ].join('\n'), 'info')
   }
   const refresh = async (ctx: ExtensionContext) => {
@@ -380,5 +386,62 @@ export default function (pi: ExtensionAPI) {
     const policyFamilies = activePolicyFamilies(state)
     const source = snapshot.source === 'scoped' ? `Pi scope ${snapshot.sourceEntries} 条` : `Pi 注册表 ${snapshot.sourceEntries} 条`
     notify(ctx, `CCSwitch 自检：${source} · 唯一模型 ${counts.total} · 健康 ${counts.healthy} · 自动冷却 ${counts.cooling} · 手动禁用 ${counts.disabled} · 熔断记录 ${counts.breakerRecords} · 审查约束系列 ${policyFamilies.size} · 本session切换 ${sessionSwitches} · 累计切换 ${state.switches ?? 0}`, counts.total ? 'info' : 'warning')
+  }})
+  pi.registerCommand('ccswitch-doctor', { description: '诊断 runner.mjs 可解析性和安装情况', handler: async (_args, ctx) => {
+    const __dirname = dirname(fileURLToPath(import.meta.url))
+    const localRunner = join(__dirname, 'runner.mjs')
+    const hasLocal = existsSync(localRunner)
+    let resolvable = false
+    let resolvedPath = ''
+    try {
+      const cRequire = createRequire(import.meta.url)
+      resolvedPath = cRequire.resolve('pi-ccswitch-auto-switch/runner.mjs')
+      resolvable = true
+    } catch { /* not resolvable — expected when extension is in git checkout */ }
+
+    // 检查 npm 全局安装版本
+    let npmVersion = ''
+    const npmPkgDir = join(homedir(), '.pi/agent/npm/node_modules/pi-ccswitch-auto-switch')
+    const npmPkgJson = join(npmPkgDir, 'package.json')
+    if (existsSync(npmPkgJson)) {
+      try {
+        npmVersion = JSON.parse(readFileSync(npmPkgJson, 'utf-8')).version
+      } catch { /* ignore */ }
+    }
+    const hasNpmRunner = npmVersion && existsSync(join(npmPkgDir, 'runner.mjs'))
+
+    const lines = [
+      `CCSwitch 诊断 v${EXTENSION_VERSION}`,
+      '',
+      `扩展加载目录：${__dirname}`,
+      `本地 runner.mjs：${hasLocal ? '✅ 存在' : '❌ 缺失'}`,
+      `resolve('pi-ccswitch-auto-switch/runner.mjs')：${resolvable ? '✅ 可解析' : '❌ 不可解析'}`,
+      '',
+    ]
+    if (npmVersion) {
+      lines.push(`npm 全局安装版本：${npmVersion}${hasNpmRunner ? ' ✅ 含 runner.mjs' : ' ❌ 不含 runner.mjs（版本过旧）'}`)
+      lines.push('')
+    }
+    lines.push('--- 下游消费方正确安装方式 ---',
+      'pi-ccswitch-auto-switch 是 Pi 扩展，`pi install` 只装到 Pi 全局目录，',
+      '下游项目 require.resolve() 在自己的 node_modules 路径上解析不到。',
+      '',
+      '正确做法：在消费方项目内安装本包',
+      '  npm i github:JunyWuuuu91/pi-ccswitch-auto-switch',
+      '  或 npm i pi-ccswitch-auto-switch@latest',
+      '',
+    )
+    if (npmVersion && !hasNpmRunner) {
+      lines.push('--- 版本锁定修复 ---',
+        `npm 全局版本 ${npmVersion} 不含 runner.mjs，因为 ^0.1.x 的 caret 语义只匹配 0.1.x。`, 
+        '需手动升级 npm 侧版本：',
+        '  cd ~/.pi/agent/npm && npm install pi-ccswitch-auto-switch@latest',
+        '',
+      )
+    }
+    lines.push('也可通过 NODE_PATH 或全局路径引用：',
+      `  ${__dirname}/runner.mjs`,
+    )
+    notify(ctx, lines.join('\n'), 'info')
   }})
 }
