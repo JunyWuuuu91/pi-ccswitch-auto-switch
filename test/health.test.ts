@@ -60,3 +60,30 @@ test('recordSwitch persists cumulative count and a capped switch log', async () 
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('persists learned content-policy family constraints and reset all really clears them', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-policy-family-'))
+  const glm: ModelRef = { provider: 'zhipu', id: 'glm-4.5' }
+  try {
+    const first = new HealthStore(dir)
+    await first.load()
+    first.recordContentPolicyConstraint('glm', glm, 'sensitive sk-this-must-not-be-saved')
+    await first.flush()
+
+    const reloaded = new HealthStore(dir)
+    await reloaded.load()
+    const constraint = reloaded.snapshot.contentPolicyFamilies?.glm
+    assert.equal(constraint?.observations, 1)
+    assert.equal(constraint?.lastModel, 'zhipu/glm-4.5')
+    assert.ok((constraint?.avoidUntil ?? 0) > Date.now())
+    assert.doesNotMatch(constraint?.lastError ?? '', /sk-this-must-not-be-saved/)
+
+    reloaded.reset('all')
+    await reloaded.flush()
+    const reset = new HealthStore(dir)
+    await reset.load()
+    assert.deepEqual(reset.snapshot.contentPolicyFamilies, {})
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})

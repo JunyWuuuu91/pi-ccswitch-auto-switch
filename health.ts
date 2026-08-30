@@ -24,12 +24,25 @@ export interface HealthRecord {
   leaseUntil?: number
 }
 
+export interface ContentPolicyConstraint {
+  observations: number
+  lastObservedAt: number
+  avoidUntil: number
+  lastModel: string
+  lastError?: string
+}
+
 export interface HealthState {
   schemaVersion: 2
   updatedAt: number
   models: Record<string, HealthRecord>
   providers: Record<string, HealthRecord>
   endpoints: Record<string, HealthRecord>
+  /**
+   * 已从真实失败中学到的模型系列内容审查约束。它不会影响普通故障选模，只在本轮已经
+   * 发生 content_policy 失败时用于避开同类系列。
+   */
+  contentPolicyFamilies?: Record<string, ContentPolicyConstraint>
   /** 累计成功切换次数（跨 session 持久化，用于衡量扩展有效程度） */
   switches?: number
   /** 最近成功切换日志（有限条，环形保留） */
@@ -64,7 +77,7 @@ function safeEndpoint(value: string): string {
 }
 
 function blank(): HealthState {
-  return { schemaVersion: 2, updatedAt: Date.now(), models: {}, providers: {}, endpoints: {}, switches: 0, switchLog: [] }
+  return { schemaVersion: 2, updatedAt: Date.now(), models: {}, providers: {}, endpoints: {}, contentPolicyFamilies: {}, switches: 0, switchLog: [] }
 }
 
 function redact(text: string | undefined): string | undefined {
@@ -91,6 +104,7 @@ export class HealthStore {
   private state: HealthState = blank()
   private dirty = false
   private replaceOnFlush = false
+  private resetModels = new Set<string>()
 
   constructor(dir = agentDir()) { this.dir = dir }
   get file(): string { return join(this.dir, STATE_FILE) }
@@ -139,6 +153,24 @@ export class HealthStore {
       ...previous, consecutiveFailures: failures, totalFailures: previous.totalFailures + 1,
       lastFailureAt: Date.now(), cooldownUntil: Date.now() + cooldownMs(kind, failures, retryAfterMs),
       lastClass: kind, lastError: redact(message), leaseUntil: undefined,
+    }
+    this.touch()
+  }
+
+  /**
+   * 内容审查约束比限流/网络故障稳定得多，但仍设置 30 天证据有效期，避免模型策略升级后
+   * 永久污染路由。再次观察到同系列审查会增加证据计数并刷新有效期。
+   */
+  recordContentPolicyConstraint(family: string, model: ModelRef, message?: string): void {
+    const constraints = this.state.contentPolicyFamilies ??= {}
+    const previous = constraints[family]
+    const now = Date.now()
+    constraints[family] = {
+      observations: (previous?.observations ?? 0) + 1,
+      lastObservedAt: now,
+      avoidUntil: now + 30 * 24 * 60 * 60_000,
+      lastModel: modelKey(model),
+      lastError: redact(message),
     }
     this.touch()
   }
@@ -192,9 +224,14 @@ export class HealthStore {
   }
 
   reset(target: string | 'all'): void {
-    if (target === 'all') this.state = blank()
-    else delete this.state.models[target]
-    this.replaceOnFlush = true
+    if (target === 'all') {
+      this.state = blank()
+      this.replaceOnFlush = true
+      this.resetModels.clear()
+    } else {
+      delete this.state.models[target]
+      this.resetModels.add(target)
+    }
     this.touch()
   }
 
@@ -221,7 +258,8 @@ export class HealthStore {
   async flush(): Promise<void> {
     if (!this.dirty) return
     await this.withLock(async () => {
-      this.state = mergeState(await this.readDisk(), this.state)
+      if (!this.replaceOnFlush) this.state = mergeState(await this.readDisk(), this.state)
+      for (const key of this.resetModels) delete this.state.models[key]
       await this.commit()
     }).catch(() => {})
   }
@@ -259,6 +297,7 @@ export class HealthStore {
     await rename(temp, this.file)
     this.dirty = false
     this.replaceOnFlush = false
+    this.resetModels.clear()
   }
   private bucket(scope: HealthScope): Record<string, HealthRecord> {
     return scope === 'model' ? this.state.models : scope === 'provider' ? this.state.providers : this.state.endpoints
@@ -314,5 +353,20 @@ function mergeState(a: HealthState, b: HealthState): HealthState {
     .sort((x, y) => y.at - x.at)
     .filter((entry, index, all) => index === 0 || all[index - 1].at !== entry.at || all[index - 1].from !== entry.from || all[index - 1].to !== entry.to)
     .slice(0, 20)
-  return { schemaVersion: 2, updatedAt: Math.max(a.updatedAt ?? 0, b.updatedAt ?? 0), models: mergeBucket(a.models ?? {}, b.models ?? {}), providers: mergeBucket(a.providers ?? {}, b.providers ?? {}), endpoints: mergeBucket(a.endpoints ?? {}, b.endpoints ?? {}), switches, switchLog: log }
+  const contentPolicyFamilies: Record<string, ContentPolicyConstraint> = {}
+  for (const family of new Set([...Object.keys(a.contentPolicyFamilies ?? {}), ...Object.keys(b.contentPolicyFamilies ?? {})])) {
+    const left = a.contentPolicyFamilies?.[family]
+    const right = b.contentPolicyFamilies?.[family]
+    if (!left) contentPolicyFamilies[family] = right!
+    else if (!right) contentPolicyFamilies[family] = left
+    else {
+      const newest = right.lastObservedAt >= left.lastObservedAt ? right : left
+      contentPolicyFamilies[family] = {
+        ...newest,
+        observations: Math.max(left.observations, right.observations),
+        avoidUntil: Math.max(left.avoidUntil, right.avoidUntil),
+      }
+    }
+  }
+  return { schemaVersion: 2, updatedAt: Math.max(a.updatedAt ?? 0, b.updatedAt ?? 0), models: mergeBucket(a.models ?? {}, b.models ?? {}), providers: mergeBucket(a.providers ?? {}, b.providers ?? {}), endpoints: mergeBucket(a.endpoints ?? {}, b.endpoints ?? {}), contentPolicyFamilies, switches, switchLog: log }
 }

@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { classifyFailure, parseRetryAfter } from '../classify.ts'
-import { candidateSnapshot, chooseCandidate, effectiveCandidates, summarizeCandidateHealth } from '../candidates.ts'
+import { candidateSnapshot, chooseCandidate, effectiveCandidates, modelFamily, summarizeCandidateHealth } from '../candidates.ts'
 import { endpointKey } from '../health.ts'
 import type { ModelRef } from '../types.ts'
 
@@ -26,6 +26,64 @@ test('does not poison global health for context failures; content policy flags t
     kind: 'content_policy', scope: 'model', roundOnly: false,
   })
   assert.deepEqual(classifyFailure({ message: 'Provider finish_reason: sensitive' }).scope, 'model')
+  assert.equal(classifyFailure({ message: '该请求包含政治敏感内容，安全审核未通过' }).kind, 'content_policy')
+})
+
+test('classifies common non-policy failures into a switchable failure domain', () => {
+  assert.deepEqual(classifyFailure({ status: 402, message: 'payment required' }).scope, 'provider')
+  assert.deepEqual(classifyFailure({ status: 408, message: 'request timeout' }), { kind: 'timeout', scope: 'endpoint', roundOnly: false })
+  assert.equal(classifyFailure({ message: 'read ECONNRESET' }).scope, 'endpoint')
+  assert.equal(classifyFailure({ message: 'upstream server overloaded' }).scope, 'endpoint')
+  assert.deepEqual(classifyFailure({ message: 'unexpected provider exception' }), { kind: 'unknown', scope: 'model', roundOnly: false })
+})
+
+test('normalizes GLM variants to one family and avoids the whole family after policy rejection', () => {
+  const glm45: ModelRef = { provider: 'zhipu', id: 'glm-4.5', contextWindow: 128000, input: ['text'] }
+  const glm46: ModelRef = { provider: 'proxy', id: 'zai-org/GLM-4.6', contextWindow: 128000, input: ['text'] }
+  const chatglm: ModelRef = { provider: 'local', id: 'THUDM/chatglm3-6b', contextWindow: 128000, input: ['text'] }
+  const qwen: ModelRef = { provider: 'other', id: 'qwen3-coder', contextWindow: 128000, input: ['text'] }
+  assert.equal(modelFamily(glm45), 'glm')
+  assert.equal(modelFamily(glm46), 'glm')
+  assert.equal(modelFamily(chatglm), 'glm')
+  const next = chooseCandidate([glm45, glm46, qwen], {
+    current: glm45,
+    tried: new Set(['zhipu/glm-4.5']),
+    health,
+    failureKind: 'content_policy',
+    avoidFamilies: new Set(['glm']),
+    requiredInputs: ['text'],
+  })
+  assert.equal(next?.id, 'qwen3-coder')
+})
+
+test('a learned policy constraint does not exclude that family during an ordinary failover', () => {
+  const glm: ModelRef = { provider: 'proxy', id: 'glm-4.6', contextWindow: 128000, input: ['text'] }
+  const learned = {
+    ...health,
+    contentPolicyFamilies: {
+      glm: { observations: 1, lastObservedAt: Date.now(), avoidUntil: Date.now() + 60_000, lastModel: 'zhipu/glm-4.5' },
+    },
+  }
+  const next = chooseCandidate([glm], {
+    current: a,
+    tried: new Set(['a/coder']),
+    health: learned,
+    failureKind: 'endpoint',
+    requiredInputs: ['text'],
+  })
+  assert.equal(next?.id, 'glm-4.6')
+})
+
+test('does not route an image request to a model that explicitly only accepts text', () => {
+  const textOnly: ModelRef = { provider: 'b', id: 'coder', contextWindow: 128000, input: ['text'] }
+  const vision: ModelRef = { provider: 'c', id: 'vision', contextWindow: 128000, input: ['text', 'image'] }
+  const next = chooseCandidate([textOnly, vision], {
+    current: { ...a, input: ['text', 'image'] },
+    tried: new Set(['a/coder']),
+    health,
+    requiredInputs: ['text', 'image'],
+  })
+  assert.equal(next?.id, 'vision')
 })
 
 test('prefers the same model on another provider over another local model', () => {

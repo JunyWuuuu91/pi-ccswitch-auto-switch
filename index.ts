@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext, FailureObservation, ModelRef } from './types.ts'
 import { classifyFailure, parseRetryAfter } from './classify.ts'
-import { candidateSnapshot, effectiveCandidates, chooseCandidate, summarizeCandidateHealth } from './candidates.ts'
-import { HealthStore, endpointKey, modelKey } from './health.ts'
+import { candidateSnapshot, effectiveCandidates, chooseCandidate, modelFamily, summarizeCandidateHealth } from './candidates.ts'
+import { HealthStore, endpointKey, modelKey, type HealthState } from './health.ts'
 
 const FIRST_RESPONSE_TIMEOUT = 90_000
 const STREAM_IDLE_TIMEOUT = 120_000
@@ -32,12 +32,26 @@ interface Round {
   observation?: FailureObservation
   model?: ModelRef
   endpointFails?: EndpointFailTracker
+  /** 本轮内容审查故障转移中必须避开的模型系列（包含持久化学到的约束）。 */
+  avoidFamilies?: Set<string>
   /** 本轮内最后一次成功切换的时间；用于刷新 ROUND_LIMIT 窗口，避免供应商内部重试耗时导致误判“达到上限” */
   lastSwitchAt?: number
 }
 
 function key(model: ModelRef | undefined): string | undefined { return model && modelKey(model) }
 function canRetry(ctx: ExtensionContext): boolean { return ctx.mode === 'tui' || ctx.mode === 'rpc' }
+function activePolicyFamilies(state: HealthState, now = Date.now()): Set<string> {
+  return new Set(Object.entries(state.contentPolicyFamilies ?? {})
+    .filter(([, record]) => record.avoidUntil > now)
+    .map(([family]) => family))
+}
+
+function resolveModel(ctx: ExtensionContext, provider: string, id: string, previous?: ModelRef): ModelRef {
+  // 优先使用注册表/scope 中的完整元数据，避免 turn_end 消息只有 provider/id 时丢失 BaseURL、
+  // 上下文窗口和输入模态；previous/ctx.model 作为注册表未命中时的后备。
+  const refs = [...ctx.scopedModels.map(item => item.model), ...ctx.modelRegistry.getAvailable(), previous, ctx.model]
+  return refs.find(model => model?.provider === provider && model.id === id) ?? { provider, id }
+}
 
 export default function (pi: ExtensionAPI) {
   const health = new HealthStore()
@@ -51,10 +65,9 @@ export default function (pi: ExtensionAPI) {
   const armWatchdog = (ctx: ExtensionContext, ms: number, roundId: number) => {
     clearWatchdog()
     timer = setTimeout(() => {
-      if (!round || round.id !== roundId || (!ctx.isIdle() && !round.inTool)) {
-        round && (round.watchdog = true)
-        ctx.abort()
-      }
+      if (!round || round.id !== roundId || ctx.isIdle() || round.inTool) return
+      round.watchdog = true
+      ctx.abort()
     }, ms)
     timer.unref?.()
   }
@@ -90,7 +103,7 @@ export default function (pi: ExtensionAPI) {
       '/ccswitch refresh — 刷新 Pi 模型注册表和状态',
       '/ccswitch reactivate <provider/model|all> — 解除熔断，保留历史',
       '/ccswitch disable <provider/model> — 手动禁用模型',
-      '/ccswitch reset <provider/model|all> — 清除健康历史（需确认）',
+      '/ccswitch reset <provider/model|all> — 清除健康历史；all 也会清除已学习的审查约束（需确认）',
       '/ccswitch-test — 自检候选模型，不实际切换',
     ].join('\n'), 'info')
   }
@@ -104,16 +117,19 @@ export default function (pi: ExtensionAPI) {
     const candidates = snapshot.models
     const counts = summarizeCandidateHealth(candidates, state)
     const now = Date.now()
+    const policyFamilies = activePolicyFamilies(state, now)
     const rows = candidates.slice(0, 10).map(model => {
       const modelRecord = state.models[modelKey(model)]
       const records = [modelRecord, state.providers[model.provider], state.endpoints[endpointKey(model)]]
       const blockedUntil = Math.max(0, ...records.flatMap(record => [record?.cooldownUntil ?? 0, record?.leaseUntil ?? 0]))
-      const suffix = modelRecord?.disabled ? '手动禁用' : blockedUntil > now ? `自动冷却 ${Math.max(1, Math.ceil((blockedUntil - now) / 60_000))}m` : '健康'
+      const policySuffix = policyFamilies.has(modelFamily(model)) ? ' · 内容审查约束' : ''
+      const baseSuffix = modelRecord?.disabled ? '手动禁用' : blockedUntil > now ? `自动冷却 ${Math.max(1, Math.ceil((blockedUntil - now) / 60_000))}m` : '健康'
+      const suffix = `${baseSuffix}${policySuffix}`
       return `${modelKey(model)}  ${suffix}`
     })
     if (!ctx.ui.select) {
       const source = snapshot.source === 'scoped' ? `Pi scope ${snapshot.sourceEntries} 条` : `Pi 注册表 ${snapshot.sourceEntries} 条`
-      notify(ctx, `CCSwitch：${source} · 唯一模型 ${counts.total} · 健康 ${counts.healthy} · 自动冷却 ${counts.cooling} · 手动禁用 ${counts.disabled} · 本session切换 ${sessionSwitches} · 累计切换 ${state.switches ?? 0}`, 'info')
+      notify(ctx, `CCSwitch：${source} · 唯一模型 ${counts.total} · 健康 ${counts.healthy} · 自动冷却 ${counts.cooling} · 手动禁用 ${counts.disabled} · 审查约束系列 ${policyFamilies.size} · 本session切换 ${sessionSwitches} · 累计切换 ${state.switches ?? 0}`, 'info')
       return
     }
     const scopeLabel = snapshot.source === 'scoped' ? `Pi scope：${snapshot.sourceEntries} 条` : `Pi 可用注册表：${snapshot.sourceEntries} 条`
@@ -123,7 +139,8 @@ export default function (pi: ExtensionAPI) {
       return `  ${time} ${entry.from} 🔄 ${entry.to}`
     })
     const switchPanel = recentSwitches.length ? `\n最近切换：\n${recentSwitches.join('\n')}` : ''
-    const action = await ctx.ui.select(`CCSwitch 健康面板\n当前：${key(ctx.model) ?? '无'}\n${scopeLabel} · 唯一模型：${counts.total} · 健康：${counts.healthy} · 自动冷却：${counts.cooling} · 手动禁用：${counts.disabled}\n熔断记录：${counts.breakerRecords}\n${switchSummary}${switchPanel}\n${rows.join('\n') || '没有可用模型'}`, ['刷新', '重新激活当前模型', '禁用当前模型', '重置当前模型历史', '关闭'])
+    const policySummary = policyFamilies.size ? [...policyFamilies].join(', ') : '无'
+    const action = await ctx.ui.select(`CCSwitch 健康面板\n当前：${key(ctx.model) ?? '无'}\n${scopeLabel} · 唯一模型：${counts.total} · 健康：${counts.healthy} · 自动冷却：${counts.cooling} · 手动禁用：${counts.disabled}\n熔断记录：${counts.breakerRecords} · 审查约束系列：${policySummary}\n${switchSummary}${switchPanel}\n${rows.join('\n') || '没有可用模型'}`, ['刷新', '重新激活当前模型', '禁用当前模型', '重置当前模型历史', '关闭'])
     if (action === '刷新') await refresh(ctx)
     if (action === '重新激活当前模型' && ctx.model) { health.reactivate(ctx.model); await health.flush(); status(ctx); notify(ctx, '已重新激活当前模型') }
     if (action === '禁用当前模型' && ctx.model) { health.disable(modelKey(ctx.model), true); await health.flush(); status(ctx); notify(ctx, '已禁用当前模型', 'warning') }
@@ -161,20 +178,35 @@ export default function (pi: ExtensionAPI) {
       failTracker.isolated.add(ep)
       await health.log(`endpoint ${ep} failed ${epFails} times this round, isolating endpoint`)
     }
+    if (classification.kind === 'content_policy') {
+      health.recordContentPolicyConstraint(modelFamily(round.model), round.model, round.observation.message)
+      round.avoidFamilies ??= new Set()
+      for (const family of activePolicyFamilies(health.snapshot)) round.avoidFamilies.add(family)
+    }
     if (!classification.roundOnly && classification.scope) health.recordFailure(classification.scope, classification.scope === 'model' ? modelKey(round.model) : classification.scope === 'provider' ? round.model.provider : endpointKey(round.model), classification.kind, round.observation.message, classification.retryAfterMs)
     await health.flush()
     await refresh(ctx)
     const candidates = effectiveCandidates(ctx.scopedModels, ctx.modelRegistry.getAvailable())
-    let next = chooseCandidate(candidates, { current: round.model, tried: round.tried, failureKind: classification.kind, health: health.snapshot, avoidEndpoints: failTracker.isolated })
+    const candidateOptions = () => ({
+      current: round!.model,
+      tried: round!.tried,
+      failureKind: classification.kind,
+      health: health.snapshot,
+      avoidEndpoints: failTracker.isolated,
+      avoidFamilies: round!.avoidFamilies,
+      requiredInputs: round!.images?.length ? ['text', 'image'] : ['text'],
+    })
+    let next = chooseCandidate(candidates, candidateOptions())
     while (next) {
-      if (!await health.claimProvider(next)) { round.tried.add(modelKey(next)); next = chooseCandidate(candidates, { current: round.model, tried: round.tried, failureKind: classification.kind, health: health.snapshot, avoidEndpoints: failTracker.isolated }); continue }
+      if (!await health.claimProvider(next)) { round.tried.add(modelKey(next)); next = chooseCandidate(candidates, candidateOptions()); continue }
       round.attempts++
       ctx.ui.setWorkingMessage(`模型异常，正在切换到 ${modelKey(next)}…`)
+      const previousModel = round.model
       const set = await pi.setModel(next).catch(() => false)
       if (!set) {
         health.recordFailure('model', modelKey(next), 'model_config', 'Pi refused model selection')
         round.tried.add(modelKey(next)); await health.flush()
-        next = chooseCandidate(candidates, { current: round.model, tried: round.tried, failureKind: classification.kind, health: health.snapshot, avoidEndpoints: failTracker.isolated })
+        next = chooseCandidate(candidates, candidateOptions())
         continue
       }
       round.model = next
@@ -183,7 +215,7 @@ export default function (pi: ExtensionAPI) {
       round.lastSwitchAt = Date.now()
       // 本次 session 成功切换计数 + 持久化累计/日志（衡量扩展有效程度）
       sessionSwitches += 1
-      const fromKey = key(round.model ?? ctx.model)
+      const fromKey = key(previousModel ?? ctx.model)
       health.recordSwitch(fromKey ?? '', modelKey(next), classification.kind)
       await health.flush()
       notify(ctx, `CCSwitch：已切换至 ${modelKey(next)}（${round.attempts}/${MAX_ATTEMPTS}）`, 'info')
@@ -213,7 +245,7 @@ export default function (pi: ExtensionAPI) {
     if (event.source === 'extension') return { action: 'continue' }
     clearWatchdog()
     lastStatus = {}
-    round = { id: (round?.id ?? 0) + 1, phase: 'monitoring', startedAt: Date.now(), text: event.text, images: event.images, tried: new Set(), attempts: 0, hadTool: false, inTool: false, hadOutput: false, watchdog: false, cleanRetry: false, model: ctx.model, endpointFails: undefined }
+    round = { id: (round?.id ?? 0) + 1, phase: 'monitoring', startedAt: Date.now(), text: event.text, images: event.images, tried: new Set(), attempts: 0, hadTool: false, inTool: false, hadOutput: false, watchdog: false, cleanRetry: false, model: ctx.model, endpointFails: undefined, avoidFamilies: undefined }
     status(ctx)
     return { action: 'continue' }
   })
@@ -240,7 +272,7 @@ export default function (pi: ExtensionAPI) {
     const message = event.message
     if (message?.role !== 'assistant' || !round) return
     clearWatchdog()
-    round.model = { provider: message.provider, id: message.model }
+    round.model = resolveModel(ctx, message.provider, message.model, round.model)
     round.hadOutput ||= Boolean(message.content?.length)
     if (message.stopReason === 'error' || message.stopReason === 'aborted') {
       round.phase = 'settled-error'
@@ -256,6 +288,7 @@ export default function (pi: ExtensionAPI) {
     if (!ctx.isIdle()) return
     if (!canRetry(ctx) && round.observation && round.model) {
       const classification = classifyFailure(round.observation)
+      if (classification.kind === 'content_policy') health.recordContentPolicyConstraint(modelFamily(round.model), round.model, round.observation.message)
       if (!classification.roundOnly && classification.scope) {
         const domain = classification.scope === 'model' ? modelKey(round.model) : classification.scope === 'provider' ? round.model.provider : endpointKey(round.model)
         health.recordFailure(classification.scope, domain, classification.kind, round.observation.message, classification.retryAfterMs)
@@ -293,7 +326,8 @@ export default function (pi: ExtensionAPI) {
     const snapshot = candidateSnapshot(ctx.scopedModels, ctx.modelRegistry.getAvailable())
     const counts = summarizeCandidateHealth(snapshot.models, health.snapshot)
     const state = health.snapshot
+    const policyFamilies = activePolicyFamilies(state)
     const source = snapshot.source === 'scoped' ? `Pi scope ${snapshot.sourceEntries} 条` : `Pi 注册表 ${snapshot.sourceEntries} 条`
-    notify(ctx, `CCSwitch 自检：${source} · 唯一模型 ${counts.total} · 健康 ${counts.healthy} · 自动冷却 ${counts.cooling} · 手动禁用 ${counts.disabled} · 熔断记录 ${counts.breakerRecords} · 本session切换 ${sessionSwitches} · 累计切换 ${state.switches ?? 0}`, counts.total ? 'info' : 'warning')
+    notify(ctx, `CCSwitch 自检：${source} · 唯一模型 ${counts.total} · 健康 ${counts.healthy} · 自动冷却 ${counts.cooling} · 手动禁用 ${counts.disabled} · 熔断记录 ${counts.breakerRecords} · 审查约束系列 ${policyFamilies.size} · 本session切换 ${sessionSwitches} · 累计切换 ${state.switches ?? 0}`, counts.total ? 'info' : 'warning')
   }})
 }

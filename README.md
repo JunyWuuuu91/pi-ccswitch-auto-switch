@@ -13,7 +13,8 @@ The extension observes real Pi requests, records sanitized health signals, andâ€
 - Endpoint circuit breakers for DNS, connection, server, and streaming failures.
 - Endpoint platform isolation: when several models on the same endpoint (same BaseURL/provider) fail within one round, the whole endpoint is isolated so sibling models from the same platform are not tried one by one.
 - Model-only isolation for missing models and incompatible parameters.
-- Prefers a healthy model from another provider before considering a sibling model.
+- Learns model-family content-policy constraints from real failures (`glm-4.5` and `GLM-4.6`, for example, are both `glm`) and avoids the entire family during current and future content-policy failover chains. Evidence expires after 30 days.
+- Applies hard health, failure-domain, policy-family, input-modality, and context filters before ranking candidates by provider diversity, model equivalence, capability compatibility, and historical reliability.
   - Independent-provider semantics: a copied vendor (e.g. `my-provider-copy`) shares the BaseURL but is a distinct provider with its own endpoint key, so isolating one never blocks the other.
 - 90-second first-response and 120-second streaming-idle watchdogs.
 - Exponential cooldowns, `Retry-After` support, and one persisted half-open probe lease per provider.
@@ -54,7 +55,7 @@ CC Switch should be configured normally. This extension deliberately does not wr
 | `/ccswitch refresh` | Refresh Pi's model registry and the status display. |
 | `/ccswitch reactivate <provider/model\|all>` | Clear a breaker and let the next real request verify recovery, while preserving history. |
 | `/ccswitch disable <provider/model>` | Manually exclude a model from failover. |
-| `/ccswitch reset <provider/model\|all>` | Delete selected health history after confirmation. |
+| `/ccswitch reset <provider/model\|all>` | Delete selected health history after confirmation; `all` also clears learned content-policy constraints. |
 | `/ccswitch-test` | Inspect candidate discovery without changing models. |
 
 Examples:
@@ -90,15 +91,16 @@ The state machine waits for Pi's native retry cycle to settle before switching. 
 | --- | --- | --- |
 | `401`, `403`, quota, billing | Provider | 30 minutes |
 | `429` | Provider | `Retry-After` when present; otherwise 5 minutes |
-| DNS, network, `5xx`, interrupted stream | Endpoint | 2 minutes |
+| DNS, network, `408`, `5xx`, interrupted stream | Endpoint | 2 minutes |
 | `404`, invalid model, incompatible parameters | Model | 15 minutes |
-| Content filtering or context overflow | Current round only | None |
+| Content-policy or sensitive-content rejection | Current model + learned model-family constraint | 2-minute model cooldown; 30-day family evidence |
+| Context overflow | Current round only | None |
 
-Cooldowns grow exponentially within bounded limits. Context-overflow retries only consider models with a larger context window. User cancellations are not recorded as failures; watchdog cancellations are recorded as timeouts.
+Cooldowns grow exponentially within bounded limits. Learned policy-constrained families are excluded only after a content-policy rejection; they remain eligible during ordinary rate-limit, network, and model-configuration failovers. Context-overflow retries only consider models with a larger context window, and image requests do not move to a model that explicitly supports text only. Unknown errors are isolated to the current model and still fail over normally. A user cancellation is the only aborted turn that does not trigger failover; watchdog cancellations are recorded as timeouts.
 
 ## Data and privacy
 
-Health state is stored in Pi's agent directory as `ccswitch-auto-switch-state.json`. The extension stores counters, timestamps, cooldowns, and redacted/truncated error summaries. It does not access credentials, authorization headers, CC Switch's database, or Pi's `auth.json`.
+Health state is stored in Pi's agent directory as `ccswitch-auto-switch-state.json`. The extension stores counters, timestamps, cooldowns, learned model-family policy constraints, and redacted/truncated error summaries. It does not access credentials, authorization headers, CC Switch's database, or Pi's `auth.json`.
 
 ## Development
 
@@ -108,7 +110,7 @@ npm run typecheck
 npm test
 ```
 
-Tests use Node's built-in test runner and cover failure classification, provider-first selection, cooldowns, state persistence, and Windows-compatible paths.
+Tests use Node's built-in test runner and cover the failure matrix, family-level policy avoidance, provider-first selection, input compatibility, cooldowns, state persistence, and Windows-compatible paths.
 
 ## License
 

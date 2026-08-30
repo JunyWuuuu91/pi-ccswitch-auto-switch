@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import extension from '../index.ts'
+import { endpointKey } from '../health.ts'
 import type { ExtensionContext, ModelRef } from '../types.ts'
 
 const a: ModelRef = { provider: 'provider-a', id: 'coder', contextWindow: 128000, input: ['text'], reasoning: true }
@@ -44,6 +45,7 @@ test('provider failure moves directly to another provider rather than sibling mo
     // 切换成功后应当记录一次成功切换（session 计数 + entry 触发 TUI 重绘）
     assert.equal(appended.length, 1, 'switch should emit an appendEntry to refresh the footer')
     assert.equal(appended[0].customType, 'ccswitch-switch')
+    assert.equal(appended[0].data.from, 'provider-a/coder')
     assert.equal(appended[0].data.to, 'provider-b/coder')
     // 持久化状态应记录累计切换数
     const state = JSON.parse(readFileSync(join(dir, 'ccswitch-auto-switch-state.json'), 'utf8'))
@@ -127,10 +129,14 @@ test('content_policy failure switches to another model and records health', { co
   process.env.PI_CODING_AGENT_DIR = dir
   const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
   const selected: string[] = []
-  let activeModel: ModelRef = a
+  const glm: ModelRef = { ...a, id: 'glm-4.5' }
+  const glmSibling: ModelRef = { ...b, id: 'zai-org/GLM-4.6' }
+  const unrestricted: ModelRef = { provider: 'provider-c', id: 'qwen3-coder', contextWindow: 128000, input: ['text'], reasoning: true }
+  const secondFallback: ModelRef = { provider: 'provider-d', id: 'claude-sonnet', contextWindow: 128000, input: ['text'], reasoning: true }
+  let activeModel: ModelRef = glm
   const ctx: ExtensionContext = {
-    mode: 'tui', hasUI: true, model: a, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
-    modelRegistry: { refresh: async () => {}, getAvailable: () => [a, b] },
+    mode: 'tui', hasUI: true, model: glm, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+    modelRegistry: { refresh: async () => {}, getAvailable: () => [glm, glmSibling, unrestricted, secondFallback] },
     ui: { notify: () => {}, setStatus: () => {}, setWorkingMessage: () => {} },
   }
   try {
@@ -143,14 +149,105 @@ test('content_policy failure switches to another model and records health', { co
     await handlers.get('session_start')?.({}, ctx)
     handlers.get('input')?.({ source: 'interactive', text: 'ask something' }, ctx)
     handlers.get('after_provider_response')?.({ status: 200, headers: {} }, ctx)
-    // sensitive 内容审查：应视为模型失败并切换到 provider-b，而不是原样重试
-    await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: 'provider-a', model: 'coder', content: [], stopReason: 'error', errorMessage: 'Provider finish_reason: sensitive' } }, ctx)
+    // sensitive 内容审查：应避开所有 GLM 系列，而不是切到另一个 Provider 的 GLM。
+    await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: 'provider-a', model: 'glm-4.5', content: [], stopReason: 'error', errorMessage: 'Provider finish_reason: sensitive' } }, ctx)
     await handlers.get('agent_settled')?.({}, ctx)
-    assert.deepEqual(selected, ['provider-b/coder'], 'content policy should trigger a switch')
-    // 台账应记录 model 级失败（冷却）
+    assert.deepEqual(selected, ['provider-c/qwen3-coder'], 'content policy should skip the entire rejected model family')
+
+    // 新一轮内容审查故障转移仍会加载持久化的 glm 约束，同时累计本轮新发现的 qwen 约束。
+    handlers.get('input')?.({ source: 'interactive', text: 'ask another sensitive question' }, ctx)
+    handlers.get('after_provider_response')?.({ status: 200, headers: {} }, ctx)
+    await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: unrestricted.provider, model: unrestricted.id, content: [], stopReason: 'error', errorMessage: 'content_filter' } }, ctx)
+    await handlers.get('agent_settled')?.({}, ctx)
+    assert.deepEqual(selected, ['provider-c/qwen3-coder', 'provider-d/claude-sonnet'], 'later policy failover should keep avoiding previously learned GLM models')
+    // 台账应记录 model 级失败（冷却）以及系列级审查约束。
     const state = JSON.parse(readFileSync(join(dir, 'ccswitch-auto-switch-state.json'), 'utf8'))
-    assert.ok(state.models['provider-a/coder']?.cooldownUntil > Date.now(), 'model should be cooling after content policy failure')
-    assert.equal(state.switches, 1)
+    assert.ok(state.models['provider-a/glm-4.5']?.cooldownUntil > Date.now(), 'model should be cooling after content policy failure')
+    assert.equal(state.contentPolicyFamilies?.glm?.lastModel, 'provider-a/glm-4.5')
+    assert.ok(state.contentPolicyFamilies?.glm?.avoidUntil > Date.now())
+    assert.equal(state.contentPolicyFamilies?.qwen?.lastModel, 'provider-c/qwen3-coder')
+    assert.equal(state.switches, 2)
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('all non-user-cancel error classes reach normal failover', { concurrency: false }, async () => {
+  const cases: Array<{ name: string, status?: number, error: string, rawStopReason?: string }> = [
+    { name: 'auth', status: 401, error: 'unauthorized' },
+    { name: 'quota', status: 402, error: 'payment required' },
+    { name: 'rate limit', status: 429, error: 'rate limited' },
+    { name: 'server', status: 503, error: 'service unavailable' },
+    { name: 'request timeout', status: 408, error: 'request timeout' },
+    { name: 'transport', error: 'read ECONNRESET' },
+    { name: 'model config', status: 404, error: 'model not found' },
+    { name: 'context overflow', error: 'context window exceeded' },
+    { name: 'unknown', error: 'unexpected provider exception' },
+  ]
+
+  for (const failure of cases) {
+    const dir = await mkdtemp(join(tmpdir(), `ccswitch-${failure.name.replace(/\s+/g, '-')}-`))
+    const previous = process.env.PI_CODING_AGENT_DIR
+    process.env.PI_CODING_AGENT_DIR = dir
+    const source: ModelRef = { ...a, baseUrl: 'https://provider-a.example/v1', contextWindow: 64_000 }
+    const fallback: ModelRef = { ...b, baseUrl: 'https://provider-b.example/v1', contextWindow: 256_000 }
+    const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+    const selected: string[] = []
+    const ctx: ExtensionContext = {
+      mode: 'tui', hasUI: true, model: source, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+      modelRegistry: { refresh: async () => {}, getAvailable: () => [source, fallback] },
+      ui: { notify: () => {}, setStatus: () => {}, setWorkingMessage: () => {} },
+    }
+    try {
+      extension({
+        on: (name, handler) => handlers.set(name, handler),
+        registerCommand: () => {},
+        setModel: async model => { ctx.model = model; selected.push(`${model.provider}/${model.id}`); return true },
+        sendUserMessage: () => {},
+      })
+      await handlers.get('session_start')?.({}, ctx)
+      handlers.get('input')?.({ source: 'interactive', text: `trigger ${failure.name}` }, ctx)
+      handlers.get('after_provider_response')?.({ status: failure.status ?? 200, headers: {} }, ctx)
+      await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: source.provider, model: source.id, content: [], stopReason: 'error', rawStopReason: failure.rawStopReason, errorMessage: failure.error } }, ctx)
+      await handlers.get('agent_settled')?.({}, ctx)
+      assert.deepEqual(selected, ['provider-b/coder'], `${failure.name} should switch to the healthy fallback`)
+      if (['server', 'request timeout', 'transport'].includes(failure.name)) {
+        const state = JSON.parse(readFileSync(join(dir, 'ccswitch-auto-switch-state.json'), 'utf8'))
+        assert.ok(state.endpoints[endpointKey(source)], `${failure.name} should retain BaseURL metadata and open the correct endpoint breaker`)
+      }
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+      else process.env.PI_CODING_AGENT_DIR = previous
+      await rm(dir, { recursive: true, force: true })
+    }
+  }
+})
+
+test('a user cancellation is the only aborted turn that does not fail over', { concurrency: false }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-user-cancel-'))
+  const previous = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = dir
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+  const selected: string[] = []
+  const ctx: ExtensionContext = {
+    mode: 'tui', hasUI: true, model: a, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+    modelRegistry: { refresh: async () => {}, getAvailable: () => [a, b] },
+    ui: { notify: () => {}, setStatus: () => {}, setWorkingMessage: () => {} },
+  }
+  try {
+    extension({
+      on: (name, handler) => handlers.set(name, handler),
+      registerCommand: () => {},
+      setModel: async model => { selected.push(`${model.provider}/${model.id}`); return true },
+      sendUserMessage: () => {},
+    })
+    await handlers.get('session_start')?.({}, ctx)
+    handlers.get('input')?.({ source: 'interactive', text: 'cancel me' }, ctx)
+    await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: a.provider, model: a.id, content: [], stopReason: 'aborted' } }, ctx)
+    await handlers.get('agent_settled')?.({}, ctx)
+    assert.deepEqual(selected, [])
   } finally {
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
     else process.env.PI_CODING_AGENT_DIR = previous
