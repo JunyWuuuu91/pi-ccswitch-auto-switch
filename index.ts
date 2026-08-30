@@ -67,13 +67,14 @@ export default function (pi: ExtensionAPI) {
     const { models } = candidateSnapshot(ctx.scopedModels, ctx.modelRegistry.getAvailable())
     const counts = summarizeCandidateHealth(models, state)
     const activeModel = round?.model ?? ctx.model
+    // 恒显完整状态：健康/总数 · 冷却 · 禁用 · 本session切换 · 当前模型（均为 0 时也显示，便于确认扩展在监控中）
     const plain = round?.phase === 'switching' ? `CCS ↻${round.attempts}/${MAX_ATTEMPTS} ${modelTag(round.model)}` :
-      counts.cooling || counts.disabled ? `CCS ✓${counts.healthy}/${counts.total} · ⏳${counts.cooling} · ⛔${counts.disabled}${switchSuffix()} · ${modelTag(activeModel)}` : `CCS ✓${counts.total}${switchSuffix()} · ${modelTag(activeModel)}`
+      `CCS ✓${counts.healthy}/${counts.total} · ⏳${counts.cooling} · ⛔${counts.disabled}${switchSuffix()} · ${modelTag(activeModel)}`
     const theme = ctx.ui.theme
     ctx.ui.setStatus('ccswitch-ha', theme ? theme.fg(counts.cooling || counts.disabled ? 'warning' : 'success', plain) : plain)
   }
-  // 本次 session 成功切换计数：始终显示 ⇄N（N=0 也显示，用于确认扩展在监控中）；累计切换数在面板/自检中可见
-  const switchSuffix = () => ` · ⇄${sessionSwitches}`
+  // 本次 session 成功切换计数：始终显示 🔄N（N=0 也显示，用于确认扩展在监控中）；累计切换数在面板/自检中可见
+  const switchSuffix = () => ` · 🔄${sessionSwitches}`
   const notify = (ctx: ExtensionContext, message: string, type: 'info' | 'warning' | 'error' = 'info') => {
     if (ctx.hasUI) ctx.ui.notify(message, type)
   }
@@ -115,7 +116,7 @@ export default function (pi: ExtensionAPI) {
     const switchSummary = `本session切换：${sessionSwitches} · 累计切换：${state.switches ?? 0}`
     const recentSwitches = (state.switchLog ?? []).slice(0, 5).map(entry => {
       const time = new Date(entry.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      return `  ${time} ${entry.from} ⇄ ${entry.to}`
+      return `  ${time} ${entry.from} 🔄 ${entry.to}`
     })
     const switchPanel = recentSwitches.length ? `\n最近切换：\n${recentSwitches.join('\n')}` : ''
     const action = await ctx.ui.select(`CCSwitch 健康面板\n当前：${key(ctx.model) ?? '无'}\n${scopeLabel} · 唯一模型：${counts.total} · 健康：${counts.healthy} · 自动冷却：${counts.cooling} · 手动禁用：${counts.disabled}\n熔断记录：${counts.breakerRecords}\n${switchSummary}${switchPanel}\n${rows.join('\n') || '没有可用模型'}`, ['刷新', '重新激活当前模型', '禁用当前模型', '重置当前模型历史', '关闭'])

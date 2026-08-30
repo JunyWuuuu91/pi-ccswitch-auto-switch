@@ -58,17 +58,17 @@ pi install npm:pi-ccswitch-auto-switch
 ## 状态栏
 
 ```text
-CCS ✓70/131 · ⏳61 · ⛔0 · ⇄3 · provider/model-id
+CCS ✓70/131 · ⏳61 · ⛔0 · 🔄3 · provider/model-id
 ```
 
 - `✓70/131`：Pi 有效范围内共有 131 个去重后的 `provider/model` 组合，其中 70 个健康；重复的 scope 条目只计一次。
 - `⏳61`：有 61 个模型正受模型、Provider 或端点自动冷却影响；一条 Provider 熔断记录可能同时影响许多模型。
 - `⛔0`：没有被手动禁用的模型。
-- `⇄3`：**本次 pi session 成功切换的模型次数**（衡量扩展有效程度，0 时也显示图标）。`/new`、`/fork`、`/resume` 等新 session 开始时归零；但**失败记录与冷却状态不重置**（它们是物理事实，跨 session 保留）。累计切换数（`state.switches`）与最近 20 条切换日志会持久化到状态文件，可在 `/ccswitch` 面板和 `/ccswitch-test` 中查看。
+- `🔄3`：**本次 pi session 成功切换的模型次数**（衡量扩展有效程度，0 时也显示图标）。`/new`、`/fork`、`/resume` 等新 session 开始时归零；但**失败记录与冷却状态不重置**（它们是物理事实，跨 session 保留）。累计切换数（`state.switches`）与最近 20 条切换日志会持久化到状态文件，可在 `/ccswitch` 面板和 `/ccswitch-test` 中查看。
 - `provider/model-id`：当前实际生效的模型（`provider/id`，切换后立即更新，长名自动截断）。
 - 切换中出现 `CCS ↻2/5 provider/model`，表示正在进行最多 5 次尝试中的第 2 次。
 
-全部唯一模型都健康时会压缩显示为 `CCS ✓131 · provider/model-id`。通过 `/ccswitch` 或 `/ccswitch-test` 可同时查看 Pi 原始 scope 条目数、去重模型数、受影响模型数、底层熔断记录数、本 session 切换数与累计切换数。
+四个状态（健康/冷却/禁用/切换）即使为 0 也始终显示，便于确认扩展处于监控中；全部健康时仍显示零计数，例如 `CCS ✓131/131 · ⏳0 · ⛔0 · 🔄0 · provider/model-id`。通过 `/ccswitch` 或 `/ccswitch-test` 可同时查看 Pi 原始 scope 条目数、去重模型数、受影响模型数、底层熔断记录数、本 session 切换数与累计切换数。
 
 切换成功后扩展还会通过 `appendEntry` 向会话注入一条 `ccswitch-switch` custom entry（不参与 LLM 上下文），触发 TUI 底栏重绘——这样 Pi 右下角的模型名显示也会同步为切换后的模型。
 
