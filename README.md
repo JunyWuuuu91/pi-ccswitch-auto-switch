@@ -29,6 +29,19 @@ The extension observes real Pi requests, records sanitized health signals, andâ€
 - CC Switch `3.20+` is recommended for its native Pi model configuration support.
 - Node.js `22.19+` only for local development and tests. Pi supplies the runtime for the extension itself.
 
+## Configuration
+
+The extension requires **no user configuration**: it observes Pi's real requests and reads only the model metadata Pi already exposes. It never reads CC Switch databases, Pi auth files, API keys, cookies, or `.env` files, and it never writes Pi model settings or CC Switch data.
+
+All knobs below are optional and have sensible defaults:
+
+| Setting | Scope | Default | Notes |
+| --- | --- | --- | --- |
+| `PI_CODING_AGENT_DIR` | Extension state | `~/.pi/agent` | Where health state, logs, and failure reports are stored. Only relevant if you relocated your Pi agent directory; the extension follows Pi's own convention. |
+| `PI_BIN` | Headless runner only | `pi` on `PATH` | Must point to the real `pi` executable, never to `pi-ccswitch-run`. |
+| Model scope (`/model` etc.) | Failover candidates | Full registry | When Pi has an active model scope, failover only considers models inside that scope; otherwise the full registry is used. The status bar shows which source is active. |
+| `baseUrl` metadata | Endpoint isolation | provider key | Endpoint-level platform isolation groups models by `baseUrl` (provided by CC Switch `3.20+`). Without it, isolation degrades to provider-level grouping, which still works. |
+
 ## Installation
 
 ### Pi package install (recommended)

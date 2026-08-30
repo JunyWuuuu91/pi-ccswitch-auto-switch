@@ -27,6 +27,19 @@
 - 建议使用 CC Switch `3.20+`，其已支持原生维护 Pi 模型配置。
 - 本地开发和测试需要 Node.js `22.19+`；Pi 运行插件本身不需要额外安装 Node。
 
+## 配置
+
+插件**不需要任何用户配置**：它只观察 Pi 的真实请求，读取 Pi 已暴露的模型元数据；从不读取 CC Switch 数据库、Pi 认证文件、API Key、Cookie 或 `.env` 文件，也从不写入 Pi 模型设置或 CC Switch 数据。
+
+以下开关全部可选，且有合理默认值：
+
+| 设置项 | 作用域 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `PI_CODING_AGENT_DIR` | 扩展状态 | `~/.pi/agent` | 健康状态、日志与失败报告的存放目录；仅在你迁移了 Pi agent 目录时需要，插件跟随 Pi 自身约定。 |
+| `PI_BIN` | 仅 headless runner | `PATH` 中的 `pi` | 必须指向真实 `pi` 可执行文件，不能指向 `pi-ccswitch-run`。 |
+| 模型 scope（`/model` 等） | 故障转移候选 | 全量注册表 | Pi 启用了 model scope 时，只在 scope 内模型间切换；否则使用全量注册表。状态栏会显示当前数据源。 |
+| `baseUrl` 元数据 | 端点隔离 | provider key | 端点级平台隔离按 `baseUrl` 分组模型（由 CC Switch `3.20+` 提供）；缺失时退化为 provider 级分组，仍然可用。 |
+
 ## 安装
 
 ### 通过 Pi Package 安装（推荐）
