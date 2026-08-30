@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process'
 import { access, readFile, stat } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { basename, delimiter, dirname, extname, isAbsolute, join, resolve } from 'node:path'
+import { delimiter, dirname, extname, isAbsolute, join, resolve } from 'node:path'
 
 export const EXIT = Object.freeze({ SUCCESS: 0, EXHAUSTED: 1, CONFIG: 2, TIMEOUT: 124, INTERRUPTED: 130, TERMINATED: 143 })
 export const DEFAULT_TIMEOUT_MS = 600_000
@@ -87,9 +87,24 @@ export function buildMessage(fileText, prompt) {
   return fileText ? `${fileText}\n${prompt}` : prompt
 }
 
+const LEGACY_RUNNER_STEMS = new Set(['pi-ccswitch-run', 'ccswitch-run'])
+
+function executableStem(value) {
+  return String(value).split(/[\\/]/).pop().toLowerCase().replace(/\.(cmd|exe|bat)$/, '')
+}
+
 function validPiBinary(value) {
-  const normalized = basename(value).toLowerCase().replace(/\.(cmd|exe|bat)$/, '')
-  return normalized === 'pi'
+  return executableStem(value) === 'pi'
+}
+
+export function selectPiBinary(configured, warn = () => {}) {
+  if (!configured) return 'pi'
+  if (validPiBinary(configured)) return configured
+  if (LEGACY_RUNNER_STEMS.has(executableStem(configured))) {
+    warn("PI_BIN points to a legacy runner wrapper; ignoring it and falling back to 'pi' on PATH")
+    return 'pi'
+  }
+  throw new Error('PI_BIN must name the real pi executable, not an arbitrary command')
 }
 
 async function resolveWindowsShim(command) {
@@ -115,8 +130,7 @@ async function resolveWindowsShim(command) {
 
 async function resolvePiCommand() {
   const configured = String(process.env.PI_BIN || '').trim()
-  if (configured && !validPiBinary(configured)) throw new Error('PI_BIN must name the real pi executable, not an arbitrary command')
-  const command = configured || 'pi'
+  const command = selectPiBinary(configured, message => process.stderr.write(`pi-ccswitch-run: warning: ${message}\n`))
   if (process.platform === 'win32') return resolveWindowsShim(command)
   return { command, prefix: [] }
 }

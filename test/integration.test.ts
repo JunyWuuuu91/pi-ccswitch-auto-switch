@@ -309,7 +309,7 @@ test('exhausted phase renders stop indicator in the status bar', { concurrency: 
       sendUserMessage: () => {},
     })
     await handlers.get('session_start')?.({}, ctx)
-    assert.match(statuses[statuses.length - 1] ?? '', /CCS v0\.3\.4/, 'status bar should show the extension version')
+    assert.match(statuses[statuses.length - 1] ?? '', /CCS v0\.3\.5/, 'status bar should show the extension version')
     handlers.get('input')?.({ source: 'interactive', text: 'trigger round' }, ctx)
     handlers.get('after_provider_response')?.({ status: 429, headers: {} }, ctx)
     // 唯一候选也已冷却 → agent_settled 时 failover 无候选 → exhaust

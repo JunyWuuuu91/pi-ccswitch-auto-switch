@@ -5,7 +5,7 @@ import { PassThrough } from 'node:stream'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { EXIT, buildMessage, parseArgs, readTextFiles, run } from '../runner.mjs'
+import { EXIT, buildMessage, parseArgs, readTextFiles, run, selectPiBinary } from '../runner.mjs'
 
 function fakeRpc({ terminal = 'complete', commands = true } = {}) {
   const child = new EventEmitter()
@@ -78,4 +78,23 @@ test('runner parses supported arguments and wraps text attachments like Pi', asy
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
+})
+
+test('legacy runner PI_BIN values warn and fall back without allowing arbitrary commands', () => {
+  const warnings = []
+  const warn = message => warnings.push(message)
+  for (const configured of [
+    'pi-ccswitch-run',
+    'ccswitch-run.cmd',
+    '/opt/bin/pi-ccswitch-run',
+    'C:\\tools\\PI-CCSWITCH-RUN.EXE',
+  ]) {
+    assert.equal(selectPiBinary(configured, warn), 'pi')
+  }
+  assert.equal(warnings.length, 4)
+  assert.ok(warnings.every(message => /legacy runner wrapper/.test(message)))
+  assert.equal(selectPiBinary('', warn), 'pi')
+  assert.equal(selectPiBinary('/opt/pi.cmd', warn), '/opt/pi.cmd')
+  assert.throws(() => selectPiBinary('node', warn), /real pi executable/)
+  assert.throws(() => selectPiBinary('/usr/bin/echo', warn), /real pi executable/)
 })

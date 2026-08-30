@@ -38,7 +38,7 @@ All knobs below are optional and have sensible defaults:
 | Setting | Scope | Default | Notes |
 | --- | --- | --- | --- |
 | `PI_CODING_AGENT_DIR` | Extension state | `~/.pi/agent` | Where health state, logs, and failure reports are stored. Only relevant if you relocated your Pi agent directory; the extension follows Pi's own convention. |
-| `PI_BIN` | Headless runner only | `pi` on `PATH` | Must point to the real `pi` executable, never to `pi-ccswitch-run`. |
+| `PI_BIN` | Headless runner only | `pi` on `PATH` | Must point to the real `pi` executable. Legacy self-references to `pi-ccswitch-run` or `ccswitch-run` are ignored with a warning and fall back to `pi`; other invalid commands remain configuration errors. |
 | Model scope (`/model` etc.) | Failover candidates | Full registry | When Pi has an active model scope, failover only considers models inside that scope; otherwise the full registry is used. The status bar shows which source is active. |
 | `baseUrl` metadata | Endpoint isolation | provider key | Endpoint-level platform isolation groups models by `baseUrl` (provided by CC Switch `3.20+`). Without it, isolation degrades to provider-level grouping, which still works. |
 
@@ -93,7 +93,7 @@ cd ~/.pi/agent/npm && npm install pi-ccswitch-auto-switch@latest
 pi-ccswitch-run --no-tools --no-context-files @prompt.md "Summarize the attached text"
 ```
 
-The runner starts one `pi --mode rpc --no-session --no-extensions --extension <this package>/index.ts` process, so only CCSwitch is loaded. `PI_BIN` may point to the real Pi executable; it must not point to `pi-ccswitch-run`. The default deadline is ten minutes and can be changed with `--timeout-ms`.
+The runner starts one `pi --mode rpc --no-session --no-extensions --extension <this package>/index.ts` process, so only CCSwitch is loaded. `PI_BIN` may point to the real Pi executable. For migration safety, an old `PI_BIN=pi-ccswitch-run` or `PI_BIN=ccswitch-run` value emits a warning and falls back to `pi` on `PATH` instead of recursing or terminating every downstream job. Arbitrary commands are still rejected. The default deadline is ten minutes and can be changed with `--timeout-ms`.
 
 Exit codes are `0` for success, `1` when candidates are exhausted, `2` for invocation/RPC configuration failures, `124` for timeout, and `130`/`143` for interruption. Text `@files` are supported in the first release; images and stdin input are intentionally not.
 
@@ -121,10 +121,10 @@ Examples:
 ## Status bar
 
 ```text
-CCS v0.3.1 ✓70/131 · ⏳61 · ⛔0 · 🔄3 · provider/model-id
+CCS v0.3.5 ✓70/131 · ⏳61 · ⛔0 · 🔄3 · provider/model-id
 ```
 
-- `v0.3.1`: the installed CCSwitch extension version.
+- `v0.3.5`: the installed CCSwitch extension version.
 - `✓70/131`: 70 healthy models out of 131 unique `provider/model` combinations in Pi's effective scope. Duplicate scoped entries are counted once.
 - `⏳61`: 61 models are currently affected by automatic model, provider, or endpoint cooldowns. One provider breaker can account for many affected models.
 - `⛔0`: no manually disabled models.

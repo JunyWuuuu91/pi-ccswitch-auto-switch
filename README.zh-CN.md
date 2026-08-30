@@ -36,7 +36,7 @@
 | 设置项 | 作用域 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `PI_CODING_AGENT_DIR` | 扩展状态 | `~/.pi/agent` | 健康状态、日志与失败报告的存放目录；仅在你迁移了 Pi agent 目录时需要，插件跟随 Pi 自身约定。 |
-| `PI_BIN` | 仅 headless runner | `PATH` 中的 `pi` | 必须指向真实 `pi` 可执行文件，不能指向 `pi-ccswitch-run`。 |
+| `PI_BIN` | 仅 headless runner | `PATH` 中的 `pi` | 必须指向真实 `pi` 可执行文件。历史自引用值 `pi-ccswitch-run` 或 `ccswitch-run` 会警告并降级到 `pi`；其他非法命令仍按配置错误处理。 |
 | 模型 scope（`/model` 等） | 故障转移候选 | 全量注册表 | Pi 启用了 model scope 时，只在 scope 内模型间切换；否则使用全量注册表。状态栏会显示当前数据源。 |
 | `baseUrl` 元数据 | 端点隔离 | provider key | 端点级平台隔离按 `baseUrl` 分组模型（由 CC Switch `3.20+` 提供）；缺失时退化为 provider 级分组，仍然可用。 |
 
@@ -89,7 +89,7 @@ cd ~/.pi/agent/npm && npm install pi-ccswitch-auto-switch@latest
 pi-ccswitch-run --no-tools --no-context-files @prompt.md "请总结附件"
 ```
 
-runner 内部只显式加载本扩展并启动一次 Pi RPC；`PI_BIN` 只能指定内部真实 `pi`，不能指向 runner。默认总超时为 10 分钟，可用 `--timeout-ms` 调整。退出码：成功 `0`、候选耗尽 `1`、参数/RPC 配置错误 `2`、超时 `124`、中断 `130/143`。首版只支持文本 `@文件`，不支持图片和 stdin。
+runner 内部只显式加载本扩展并启动一次 Pi RPC；`PI_BIN` 应指定内部真实 `pi`。为兼容旧配置，`PI_BIN=pi-ccswitch-run` 或 `PI_BIN=ccswitch-run` 会输出警告并降级到 `PATH` 中的 `pi`，避免递归和长驻消费方连续失败；其他任意命令仍会被拒绝。默认总超时为 10 分钟，可用 `--timeout-ms` 调整。退出码：成功 `0`、候选耗尽 `1`、参数/RPC 配置错误 `2`、超时 `124`、中断 `130/143`。首版只支持文本 `@文件`，不支持图片和 stdin。
 
 正常使用 CC Switch 配置 Provider 即可；本插件不会修改 Pi 模型设置或 CC Switch 数据。
 
@@ -109,10 +109,10 @@ runner 内部只显式加载本扩展并启动一次 Pi RPC；`PI_BIN` 只能指
 ## 状态栏
 
 ```text
-CCS v0.3.1 ✓70/131 · ⏳61 · ⛔0 · 🔄3 · provider/model-id
+CCS v0.3.5 ✓70/131 · ⏳61 · ⛔0 · 🔄3 · provider/model-id
 ```
 
-- `v0.3.1`：当前安装的 CCSwitch 扩展版本。
+- `v0.3.5`：当前安装的 CCSwitch 扩展版本。
 - `✓70/131`：Pi 有效范围内共有 131 个去重后的 `provider/model` 组合，其中 70 个健康；重复的 scope 条目只计一次。
 - `⏳61`：有 61 个模型正受模型、Provider 或端点自动冷却影响；一条 Provider 熔断记录可能同时影响许多模型。
 - `⛔0`：没有被手动禁用的模型。
