@@ -151,6 +151,20 @@ The state machine waits for Pi's native retry cycle to settle before switching. 
 
 Cooldowns grow exponentially within bounded limits. Learned policy-constrained families are excluded only after a content-policy rejection; they remain eligible during ordinary rate-limit, network, and model-configuration failovers. Context-overflow retries only consider models with a larger context window, and image requests do not move to a model that explicitly supports text only. Unknown errors are isolated to the current model and still fail over normally. A user cancellation is the only aborted turn that does not trigger failover; watchdog cancellations are recorded as timeouts.
 
+### Modality precheck (automatic switch to a multimodal model for images)
+
+When building a provider request, Pi silently handles images according to the current model's `input` capabilities: if the model does not support images (its `input` does not include `image`), Pi replaces the image with a text placeholder `(image omitted: model does not support images)` — **the request does not fail**, so the reactive failover path never fires and the model just answers "I can't see the image", which is useless for OCR tasks.
+
+CCSwitch therefore prechecks **before the request is sent**, instead of waiting for a failure:
+
+- When user input carries images (`input` event with `images`), CCSwitch immediately switches to a healthy multimodal candidate (`input` explicitly includes `image`) before the request is processed, so the images are preserved;
+- When a tool execution returns images (e.g. the `read` tool loading an image file, whose result content includes `image` parts), CCSwitch also switches to a multimodal model before the next LLM call, so the tool-result images are not stripped;
+- Only models that **explicitly** support images (`input` includes `image`) are considered; models with missing metadata are never assumed to support images;
+- The switch reason is recorded as `modality` and counted in both the session and lifetime switch counters;
+- If no multimodal candidate is available, CCSwitch notifies the user and keeps the current model (Pi will still strip the image and add its notice).
+
+The modality precheck applies only in interactive TUI/RPC sessions (the same scope as failover); print/json modes only monitor and never switch.
+
 ## Data and privacy
 
 Health state is stored in Pi's agent directory as `ccswitch-auto-switch-state.json`. The extension stores counters, timestamps, cooldowns, learned model-family policy constraints, and redacted/truncated error summaries. It does not access credentials, authorization headers, CC Switch's database, or Pi's `auth.json`.

@@ -324,3 +324,156 @@ test('exhausted phase renders stop indicator in the status bar', { concurrency: 
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('input with images proactively switches to multimodal candidate', { concurrency: false }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-modality-input-'))
+  const previous = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = dir
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+  const selected: string[] = []
+  const sent: unknown[] = []
+  const appended: Array<{ customType: string, data: Record<string, unknown> }> = []
+  const textOnly: ModelRef = { provider: 'provider-a', id: 'text-only', contextWindow: 128000, input: ['text'] }
+  const vision: ModelRef = { provider: 'provider-b', id: 'vision', contextWindow: 128000, input: ['text', 'image'] }
+  let activeModel: ModelRef = textOnly
+  const ctx: ExtensionContext = {
+    mode: 'tui', hasUI: true, model: textOnly, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+    modelRegistry: { refresh: async () => {}, getAvailable: () => [textOnly, vision] },
+    ui: { notify: () => {}, setStatus: () => {}, setWorkingMessage: () => {} },
+  }
+  try {
+    extension({
+      on: (name, handler) => handlers.set(name, handler),
+      registerCommand: () => {},
+      setModel: async model => { activeModel = model; ctx.model = model; selected.push(`${model.provider}/${model.id}`); return true },
+      sendUserMessage: content => sent.push(content),
+      appendEntry: (customType, data) => appended.push({ customType, data }),
+    })
+    await handlers.get('session_start')?.({}, ctx)
+    await handlers.get('input')?.({ source: 'interactive', text: 'read this screenshot', images: [{ type: 'image', data: 'mock', mimeType: 'image/png' }] }, ctx)
+    // 应切换到多模态模型，不重发消息
+    assert.deepEqual(selected, ['provider-b/vision'], 'should switch to multimodal model')
+    assert.equal(sent.length, 0, 'should NOT re-send message (no sendUserMessage for proactive switch)')
+    assert.equal(activeModel.provider, 'provider-b')
+    assert.equal(activeModel.id, 'vision')
+    // 应记录切换（reason modality）
+    assert.equal(appended.length, 1, 'switch should emit appendEntry')
+    assert.equal(appended[0].customType, 'ccswitch-switch')
+    assert.equal(appended[0].data.reason, 'modality')
+    assert.equal(appended[0].data.from, 'provider-a/text-only')
+    assert.equal(appended[0].data.to, 'provider-b/vision')
+    // 持久化状态应有 switchLog
+    const state = JSON.parse(readFileSync(join(dir, 'ccswitch-auto-switch-state.json'), 'utf8'))
+    assert.equal(state.switches, 1)
+    assert.equal(state.switchLog?.[0]?.to, 'provider-b/vision')
+    assert.equal(state.switchLog?.[0]?.reason, 'modality')
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('input with images but no multimodal candidate does nothing', { concurrency: false }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-modality-none-'))
+  const previous = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = dir
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+  const selected: string[] = []
+  const notifications: string[] = []
+  const textOnlyA: ModelRef = { provider: 'provider-a', id: 'model-a', contextWindow: 128000, input: ['text'] }
+  const textOnlyB: ModelRef = { provider: 'provider-b', id: 'model-b', contextWindow: 128000, input: ['text'] }
+  let activeModel: ModelRef = textOnlyA
+  const ctx: ExtensionContext = {
+    mode: 'tui', hasUI: true, model: textOnlyA, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+    modelRegistry: { refresh: async () => {}, getAvailable: () => [textOnlyA, textOnlyB] },
+    ui: { notify: (msg) => { notifications.push(msg) }, setStatus: () => {}, setWorkingMessage: () => {} },
+  }
+  try {
+    extension({
+      on: (name, handler) => handlers.set(name, handler),
+      registerCommand: () => {},
+      setModel: async model => { activeModel = model; ctx.model = model; selected.push(`${model.provider}/${model.id}`); return true },
+      sendUserMessage: () => {},
+    })
+    await handlers.get('session_start')?.({}, ctx)
+    await handlers.get('input')?.({ source: 'interactive', text: 'read this screenshot', images: [{ type: 'image', data: 'mock', mimeType: 'image/png' }] }, ctx)
+    // 应保持原模型，无切换，通知用户
+    assert.deepEqual(selected, [], 'should NOT switch when no multimodal candidate')
+    assert.ok(notifications.some(n => n.includes('没有可用的多模态候选') || n.includes('无可用的多模态候选')), 'should notify user about no multimodal candidate')
+    assert.equal(activeModel.provider, 'provider-a')
+    const state = JSON.parse(readFileSync(join(dir, 'ccswitch-auto-switch-state.json'), 'utf8'))
+    assert.equal(state.switches ?? 0, 0, 'no switch should have occurred')
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('input with images and current model already multimodal does not switch', { concurrency: false }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-modality-already-'))
+  const previous = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = dir
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+  const selected: string[] = []
+  const vision: ModelRef = { provider: 'provider-a', id: 'vision', contextWindow: 128000, input: ['text', 'image'] }
+  let activeModel: ModelRef = vision
+  const ctx: ExtensionContext = {
+    mode: 'tui', hasUI: true, model: vision, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+    modelRegistry: { refresh: async () => {}, getAvailable: () => [vision] },
+    ui: { notify: () => {}, setStatus: () => {}, setWorkingMessage: () => {} },
+  }
+  try {
+    extension({
+      on: (name, handler) => handlers.set(name, handler),
+      registerCommand: () => {},
+      setModel: async model => { activeModel = model; ctx.model = model; selected.push(`${model.provider}/${model.id}`); return true },
+      sendUserMessage: () => {},
+    })
+    await handlers.get('session_start')?.({}, ctx)
+    await handlers.get('input')?.({ source: 'interactive', text: 'read this', images: [{ type: 'image', data: 'mock', mimeType: 'image/png' }] }, ctx)
+    assert.deepEqual(selected, [], 'should NOT switch when current model is already multimodal')
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('tool result with image proactively switches to multimodal candidate', { concurrency: false }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-modality-tool-'))
+  const previous = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = dir
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+  const selected: string[] = []
+  const textOnly: ModelRef = { provider: 'provider-a', id: 'text-only', contextWindow: 128000, input: ['text'] }
+  const vision: ModelRef = { provider: 'provider-b', id: 'vision', contextWindow: 128000, input: ['text', 'image'] }
+  let activeModel: ModelRef = textOnly
+  const ctx: ExtensionContext = {
+    mode: 'tui', hasUI: true, model: textOnly, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+    modelRegistry: { refresh: async () => {}, getAvailable: () => [textOnly, vision] },
+    ui: { notify: () => {}, setStatus: () => {}, setWorkingMessage: () => {} },
+  }
+  try {
+    extension({
+      on: (name, handler) => handlers.set(name, handler),
+      registerCommand: () => {},
+      setModel: async model => { activeModel = model; ctx.model = model; selected.push(`${model.provider}/${model.id}`); return true },
+      sendUserMessage: () => {},
+    })
+    await handlers.get('session_start')?.({}, ctx)
+    // 先建立 round（通过 input 事件，不带图片）
+    handlers.get('input')?.({ source: 'interactive', text: 'read the image file' }, ctx)
+    // 模拟工具执行：read 图片文件返回含 image content 的结果
+    handlers.get('tool_execution_start')?.({ toolCallId: 't1', toolName: 'read', args: { path: '/screenshot.png' } }, ctx)
+    await handlers.get('tool_execution_end')?.({ toolCallId: 't1', toolName: 'read', result: { content: [{ type: 'text', text: 'Read image file [image/png]' }, { type: 'image', data: 'base64mock', mimeType: 'image/png' }] }, isError: false }, ctx)
+    // 应切换到多模态模型
+    assert.deepEqual(selected, ['provider-b/vision'], 'tool image result should trigger switch to multimodal model')
+    assert.equal(activeModel.provider, 'provider-b')
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})

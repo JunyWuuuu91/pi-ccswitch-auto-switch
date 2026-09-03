@@ -75,6 +75,17 @@ export function summarizeCandidateHealth(models: ModelRef[], health: HealthState
   return { total: models.length, healthy, cooling, disabled, breakerRecords }
 }
 
+/**
+ * 模态预检候选：明确声明支持图片输入的健康模型，按优先级排序。
+ * 用于当前模型不支持图片但输入/工具结果带图时的主动切换。
+ * 只选择 input 元数据明确包含 'image' 的模型，元数据缺失的模型不冒险选择。
+ */
+export function multimodalCandidates(candidates: ModelRef[], current: ModelRef | undefined, health: HealthState, now = Date.now()): ModelRef[] {
+  return candidates
+    .filter(model => model.input?.includes('image') && !blocked(model, health, now) && !(current && modelKey(model) === modelKey(current)))
+    .sort((a, b) => score(a, current, health) - score(b, current, health))
+}
+
 export function chooseCandidate(models: ModelRef[], options: CandidateOptions): ModelRef | undefined {
   const current = options.current
   const candidates = models.filter(model => {

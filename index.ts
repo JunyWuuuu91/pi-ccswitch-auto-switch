@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ExtensionAPI, ExtensionContext, FailureObservation, ModelRef } from './types.ts'
 import { classifyFailure, parseRetryAfter } from './classify.ts'
-import { candidateSnapshot, effectiveCandidates, chooseCandidate, modelFamily, summarizeCandidateHealth } from './candidates.ts'
+import { candidateSnapshot, effectiveCandidates, chooseCandidate, multimodalCandidates, modelFamily, summarizeCandidateHealth } from './candidates.ts'
 import { HealthStore, endpointKey, modelKey, type HealthState } from './health.ts'
 
 const FIRST_RESPONSE_TIMEOUT = 90_000
@@ -13,7 +13,7 @@ const STREAM_IDLE_TIMEOUT = 120_000
 const MAX_ATTEMPTS = 5
 const ROUND_LIMIT = 8 * 60_000
 const RPC_PROTOCOL_VERSION = 1
-const EXTENSION_VERSION = '0.3.5'
+const EXTENSION_VERSION = '0.3.6'
 // 同端点（BaseURL 相同）连续失败达到该次数即隔离该端点，避免同一个平台的多个模型逐个试错耗尽本轮切换
 const ENDPOINT_FAIL_THRESHOLD = 3
 
@@ -58,6 +58,19 @@ function resolveModel(ctx: ExtensionContext, provider: string, id: string, previ
   // 上下文窗口和输入模态；previous/ctx.model 作为注册表未命中时的后备。
   const refs = [...ctx.scopedModels.map(item => item.model), ...ctx.modelRegistry.getAvailable(), previous, ctx.model]
   return refs.find(model => model?.provider === provider && model.id === id) ?? { provider, id }
+}
+
+/**
+ * 判断工具执行结果是否包含图片内容（如 read 工具读取图片文件后返回的
+ * { content: [{ type: 'image', ... }] } 结构）。递归查找，兼容各种 result 形状。
+ */
+function resultContainsImage(result: unknown): boolean {
+  if (Array.isArray(result)) return result.some(part => resultContainsImage(part))
+  if (!result || typeof result !== 'object') return false
+  const record = result as Record<string, unknown>
+  if (record.type === 'image') return true
+  if (Array.isArray(record.content)) return record.content.some(part => resultContainsImage(part))
+  return false
 }
 
 export default function (pi: ExtensionAPI) {
@@ -185,6 +198,50 @@ export default function (pi: ExtensionAPI) {
     notify(ctx, `CCSwitch：自动切换停止（${reason}），请用 /ccswitch 查看详情`, 'error')
     status(ctx)
   }
+  /**
+   * 模态预检主动切换：当前模型不支持图片但本轮输入/工具结果带图时，
+   * 主动切到一个健康的多模态候选（不等失败）。无候选时通知并保持原模型。
+   */
+  const proactiveModalitySwitch = async (ctx: ExtensionContext, round: Round): Promise<void> => {
+    const current = round.model ?? ctx.model
+    if (!current || !canRetry(ctx) || round.phase !== 'monitoring') return
+    if (current.input?.includes('image')) return
+    const candidates = effectiveCandidates(ctx.scopedModels, ctx.modelRegistry.getAvailable())
+    const next = multimodalCandidates(candidates, current, health.snapshot)[0]
+    if (!next) {
+      await health.log(`modality precheck: no multimodal candidate, staying on ${modelKey(current)}`)
+      notify(ctx, 'CCSwitch：当前模型不支持图片，且没有可用的多模态候选模型，已保持原模型', 'warning')
+      status(ctx)
+      return
+    }
+    const previousModel = current
+    const set = await pi.setModel(next).catch(() => false)
+    if (!set) {
+      await health.log(`modality precheck: Pi refused model selection ${modelKey(next)}`)
+      notify(ctx, `CCSwitch：多模态候选 ${modelKey(next)} 切换失败，已保持原模型`, 'warning')
+      status(ctx)
+      return
+    }
+    round.model = next
+    round.lastSwitchAt = Date.now()
+    sessionSwitches += 1
+    health.recordSwitch(modelKey(previousModel), modelKey(next), 'modality')
+    await health.flush()
+    try {
+      pi.appendEntry?.('ccswitch-switch', {
+        protocolVersion: RPC_PROTOCOL_VERSION,
+        roundId: round.id,
+        from: modelKey(previousModel),
+        to: modelKey(next),
+        reason: 'modality',
+        sessionSwitches,
+      })
+    } catch { /* appendEntry 失败不影响切换 */ }
+    await health.log(`modality precheck switch: ${modelKey(previousModel)} -> ${modelKey(next)}`)
+    notify(ctx, `CCSwitch：检测到图片输入，已切换至多模态模型 ${modelKey(next)}`, 'info')
+    status(ctx)
+  }
+
   const failover = async (ctx: ExtensionContext) => {
     if (!round || !round.observation || !round.model || !canRetry(ctx)) return
     // 窗口从上一次成功切换（或本轮开始）起算：供应商内部重试耗时不应消耗整轮限额
@@ -284,12 +341,15 @@ export default function (pi: ExtensionAPI) {
     await health.log('extension started')
   })
   pi.on('session_shutdown', async (_event, ctx) => { clearWatchdog(); ctx.ui.setWorkingMessage(); if (sessionSwitches > 0) await health.log(`session ended with ${sessionSwitches} successful switches`); await health.flush() })
-  pi.on('input', (event, ctx) => {
+  pi.on('input', async (event, ctx) => {
     if (event.source === 'extension') return { action: 'continue' }
     clearWatchdog()
     lastStatus = {}
     round = { id: (round?.id ?? 0) + 1, phase: 'monitoring', startedAt: Date.now(), text: event.text, images: event.images, tried: new Set(), attempts: 0, hadTool: false, inTool: false, hadOutput: false, watchdog: false, cleanRetry: false, model: ctx.model, endpointFails: undefined, avoidFamilies: undefined }
     status(ctx)
+    // 模态预检：输入带图片但当前模型不支持图片（非多模态）→ 主动切换到多模态模型，
+    // 避免 Pi 静默剥图后模型只回答“看不到图片”（此类情况不会触发 failover）。
+    if (event.images?.length && round.phase === 'monitoring') await proactiveModalitySwitch(ctx, round)
     return { action: 'continue' }
   })
   pi.on('before_provider_request', (_event, ctx) => { lastStatus = {}; if (round) { round.inTool = false; armWatchdog(ctx, FIRST_RESPONSE_TIMEOUT, round.id) } })
@@ -310,7 +370,13 @@ export default function (pi: ExtensionAPI) {
     }
   })
   pi.on('tool_execution_start', () => { if (round) { round.hadTool = true; round.inTool = true; clearWatchdog() } })
-  pi.on('tool_execution_end', () => { if (round) round.inTool = false })
+  pi.on('tool_execution_end', async (_event, ctx) => {
+    if (!round) return
+    round.inTool = false
+    // 工具结果含图片（如 read 图片文件）且当前模型不支持 → 主动切换多模态模型，
+    // 确保下一轮 LLM 调用使用新模型，工具结果中的图片不被 Pi 静默剥除。
+    if (round.phase === 'monitoring' && resultContainsImage(_event.result)) await proactiveModalitySwitch(ctx, round)
+  })
   pi.on('turn_end', async (event, ctx) => {
     const message = event.message
     if (message?.role !== 'assistant' || !round) return
