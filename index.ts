@@ -12,7 +12,7 @@ const FIRST_RESPONSE_TIMEOUT = 90_000
 const STREAM_IDLE_TIMEOUT = 120_000
 const ROUND_LIMIT = 8 * 60_000
 const RPC_PROTOCOL_VERSION = 1
-const EXTENSION_VERSION = '0.3.6'
+const EXTENSION_VERSION = '0.3.8'
 // 同端点（BaseURL 相同）连续失败达到该次数即隔离该端点，避免同一个平台的多个模型逐个试错耗尽本轮切换
 const ENDPOINT_FAIL_THRESHOLD = 3
 
