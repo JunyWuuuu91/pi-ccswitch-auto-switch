@@ -10,7 +10,6 @@ import { HealthStore, endpointKey, modelKey, type HealthState } from './health.t
 
 const FIRST_RESPONSE_TIMEOUT = 90_000
 const STREAM_IDLE_TIMEOUT = 120_000
-const MAX_ATTEMPTS = 5
 const ROUND_LIMIT = 8 * 60_000
 const RPC_PROTOCOL_VERSION = 1
 const EXTENSION_VERSION = '0.3.6'
@@ -41,7 +40,7 @@ interface Round {
   endpointFails?: EndpointFailTracker
   /** 本轮内容审查故障转移中必须避开的模型系列（包含持久化学到的约束）。 */
   avoidFamilies?: Set<string>
-  /** 本轮内最后一次成功切换的时间；用于刷新 ROUND_LIMIT 窗口，避免供应商内部重试耗时导致误判“达到上限” */
+  /** 本轮内最后一次成功切换的时间；用于刷新 ROUND_LIMIT 窗口，避免供应商内部重试耗时导致误判“超过本轮时间限制” */
   lastSwitchAt?: number
 }
 
@@ -104,7 +103,7 @@ export default function (pi: ExtensionAPI) {
     const activeModel = round?.model ?? ctx.model
     // 恒显完整状态：健康/总数 · 冷却 · 禁用 · 本session切换 · 当前模型（均为 0 时也显示，便于确认扩展在监控中）
     const prefix = `CCS v${EXTENSION_VERSION}`
-    const plain = round?.phase === 'switching' ? `${prefix} ↻${round.attempts}/${MAX_ATTEMPTS} ${modelTag(round.model)}` :
+    const plain = round?.phase === 'switching' ? `${prefix} ↻${round.attempts} ${modelTag(round.model)}` :
       round?.phase === 'exhausted' ? `${prefix} ⏸切换停止 ${modelTag(round.model ?? ctx.model)}` :
       `${prefix} ✓${counts.healthy}/${counts.total} · ⏳${counts.cooling} · ⛔${counts.disabled}${switchSuffix()} · ${modelTag(activeModel)}`
     const theme = ctx.ui.theme
@@ -246,7 +245,7 @@ export default function (pi: ExtensionAPI) {
     if (!round || !round.observation || !round.model || !canRetry(ctx)) return
     // 窗口从上一次成功切换（或本轮开始）起算：供应商内部重试耗时不应消耗整轮限额
     const windowStart = Math.max(round.startedAt, round.lastSwitchAt ?? 0)
-    if (round.attempts >= MAX_ATTEMPTS || Date.now() - windowStart >= ROUND_LIMIT) return exhaust(ctx, '达到本轮切换上限')
+    if (Date.now() - windowStart >= ROUND_LIMIT) return exhaust(ctx, '超过本轮时间限制')
     const classification = classifyFailure(round.observation)
     if (round.observation.aborted && !round.observation.watchdog) { round.phase = 'idle'; clearWatchdog(); status(ctx); return }
     round.phase = 'switching'
@@ -294,14 +293,14 @@ export default function (pi: ExtensionAPI) {
       }
       round.model = next
       round.phase = 'redispatching'
-      // 刷新本轮切换时间窗：成功切换后重新起算 ROUND_LIMIT，避免长重试轮被误判为“达到上限”
+      // 刷新本轮切换时间窗：成功切换后重新起算 ROUND_LIMIT，避免长重试轮被误判为“超过时间限制”
       round.lastSwitchAt = Date.now()
       // 本次 session 成功切换计数 + 持久化累计/日志（衡量扩展有效程度）
       sessionSwitches += 1
       const fromKey = key(previousModel ?? ctx.model)
       health.recordSwitch(fromKey ?? '', modelKey(next), classification.kind)
       await health.flush()
-      notify(ctx, `CCSwitch：已切换至 ${modelKey(next)}（${round.attempts}/${MAX_ATTEMPTS}）`, 'info')
+      notify(ctx, `CCSwitch：已切换至 ${modelKey(next)}（第${round.attempts}次切换）`, 'info')
       // 触发 TUI 底栏/界面重绘：appendEntry 会发出 entry_appended 事件进入 session.subscribe 流，
       // interactive-mode 收到后执行 footer.invalidate() + requestRender()，footer 从 session.state.model 重新读取，
       // 从而让右下角模型名同步显示新模型（setModel 只改 state，不直接触发 footer 刷新）。

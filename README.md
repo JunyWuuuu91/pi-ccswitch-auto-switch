@@ -130,7 +130,7 @@ CCS v0.3.5 ✓70/131 · ⏳61 · ⛔0 · 🔄3 · provider/model-id
 - `⛔0`: no manually disabled models.
 - `🔄3`: **本次 pi session 成功切换的模型次数**（衡量扩展有效程度）。`/new`、`/fork`、`/resume` 等新 session 开始时归零；但**失败记录与冷却状态不重置**（它们是物理事实，跨 session 保留）。累计切换数（`state.switches`）与最近 20 条切换日志会持久化到状态文件，可在 `/ccswitch` 面板和 `/ccswitch-test` 中查看。
 - `provider/model-id`: 当前实际生效的模型（`provider/id`，切换后立即更新，长名自动截断）。
-- During a switch, `CCS ↻2/5 provider/model` means the second of at most five attempts is being made.
+- During a switch, `CCS ↻2 provider/model` means this is the second switch attempt of the current round. Attempts are only bounded by the round time window, not a fixed count; a round fails only once every candidate has been tried.
 
 四个状态（健康/冷却/禁用/切换）即使为 0 也始终显示，便于确认扩展处于监控中。All-healthy still shows zero counters, e.g. `CCS ✓131/131 · ⏳0 · ⛔0 · 🔄0 · provider/model-id`. Use `/ccswitch` or `/ccswitch-test` to see Pi's raw scope entry count, the deduplicated model count, affected model counts, and the underlying breaker-record count.
 

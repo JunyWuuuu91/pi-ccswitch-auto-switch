@@ -189,7 +189,7 @@ export async function run(options, runtime = {}) {
     if (entry.data?.protocolVersion !== 1) return
     if (entry.type === 'ccswitch-switch') {
       retryPending = true
-      log(`switch ${entry.data.from || '?'} → ${entry.data.to || '?'} (${entry.data.attempts ?? '?'}/5)`)
+      log(`switch ${entry.data.from || '?'} → ${entry.data.to || '?'} (${entry.data.attempts ?? '?'})`)
     } else if (entry.type === 'ccswitch-complete') {
       terminal = { kind: 'complete', data: entry.data }
     } else if (entry.type === 'ccswitch-exhausted') {
