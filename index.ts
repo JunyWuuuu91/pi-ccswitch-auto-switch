@@ -422,7 +422,26 @@ export default function (pi: ExtensionAPI) {
     }
     await failover(ctx)
   })
-  pi.on('model_select', (_event, ctx) => status(ctx))
+  pi.on('model_select', (event, ctx) => {
+    // 用户手动切换模型（TUI 模型选择器 / /model / 方向键循环）。让 ccs 跟随：
+    // 更新“当前模型”并重置本轮故障转移状态，否则 round.model 停留在上一轮使用的模型，
+    // 导致状态栏与后续 failover 都滞后于实际选择，直到下次 input 才偶尔纠正。
+    const selected = event?.model ?? ctx.model
+    if (selected && round) {
+      round.model = selected
+      round.tried = new Set()
+      round.attempts = 0
+      round.observation = undefined
+      round.watchdog = false
+      round.cleanRetry = false
+      round.avoidFamilies = undefined
+      round.endpointFails = undefined
+      // 仅当不在活跃输入轮（monitoring 由 input 事件设置）时才退回 idle；
+      // TUI 在流式/工具执行中禁止切模型，故 active 态下不会触发，此处仅为防御。
+      if (round.phase !== 'monitoring') round.phase = 'idle'
+    }
+    status(ctx)
+  })
 
   pi.registerCommand('ccswitch', { description: '查看和管理 CCSwitch 自动故障转移健康状态', handler: async (args, ctx) => {
     const [verb, target] = args.trim().split(/\s+/, 2)
