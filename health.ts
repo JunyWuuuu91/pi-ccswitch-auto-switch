@@ -67,6 +67,16 @@ export function endpointKey(model: ModelRef): string {
   return createHash('sha256').update(`${model.provider}\0${source}`).digest('hex').slice(0, 20)
 }
 
+/**
+ * 同平台标识：仅按 BaseURL 归组（不含 provider 名）。b-ai / b-ai-copy / b-ai-copy-copy 这类
+ * 同一上游平台的多个 provider 副本会得到相同 key，用于本轮内同平台隔离。
+ * 注意：与 endpointKey（含 provider，用于跨轮健康台账）刻意不同——不同的 API key
+ * 有独立的配额/限流，跨轮冷却不应互相波及。
+ */
+export function platformKey(model: ModelRef): string {
+  return model.baseUrl ? safeEndpoint(model.baseUrl) : `provider:${model.provider}`
+}
+
 function safeEndpoint(value: string): string {
   try {
     const url = new URL(value)

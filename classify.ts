@@ -8,7 +8,9 @@ export interface Classification {
 }
 
 const content = /content[ _-]?(?:filter|policy|blocked|moderation)|sensitive|guardrail|policy[_ -]?violation|responsibleai|safety[_ -]?(?:policy|filter|violation)|security[_ -]?policy|moderation[_ -]?(?:blocked|failed)|blocked by.{0,20}(?:policy|safety|moderation)|data[_ -]?inspection[_ -]?failed|内容(?:审查|审核|安全|违规|被拦截)|安全审核|安全(?:策略|风控).{0,12}(?:阻断|拦截|拒绝)|审核(?:未通过|不通过|失败)|敏感(?:内容|词|信息)?|政治敏感|涉政|不合规|违反.{0,12}(?:安全|政策|规定)/i
-const quota = /quota|billing|insufficient.?balance|out of budget|usage.?limit|credit.?balance|monthly.?limit/i
+// 配额/余额类失败（scope provider）。含中文供应商报错：用户积分不足、余额不足、欠费等，
+// 这些通常不携带英文关键词，漏分类会落入 unknown（仅 2min 模型级冷却），导致死 provider 每轮重试。
+const quota = /quota|billing|insufficient.?balance|out of budget|usage.?limit|credit.?balance|monthly.?limit|积分不足|余额不足|欠费|请充值|额度.{0,6}(?:用完|耗尽|不足|已用)|无可用额度/i
 const context = /context.?window|context.?length|too many tokens|prompt is too long|input is too long|token limit/i
 const transport = /dns|enotfound|eai_again|econn(?:reset|refused|aborted)|epipe|socket|connection|network|fetch failed|tls|certificate|timed? ?out|timeout|stream ended|terminated|websocket|und_err/i
 const overloaded = /overload|server busy|service unavailable|temporarily unavailable|capacity|upstream|bad gateway/i

@@ -160,3 +160,13 @@ test('same baseURL on different providers are independent endpoints (copy-vendor
   const next = chooseCandidate([bai, baiCopy], { current: bai, tried: new Set(['my-provider/model-a']), health, avoidEndpoints: new Set([endpointKey(bai)]) })
   assert.equal(next?.provider, 'my-provider-copy')
 })
+
+test('classifies Chinese quota/balance errors as provider quota', () => {
+  // 真实案例：joyagent 返回 403 {"code":"1058","message":"用户积分不足"}，
+  // 若 status 未被捕获，中文消息必须仍命中 quota（provider 冷却），而不是 unknown（仅 2min 模型冷却）
+  assert.equal(classifyFailure({ message: '403: {"code":"1058","message":"用户积分不足"}' }).kind, 'quota')
+  assert.equal(classifyFailure({ message: '403: {"code":"1058","message":"用户积分不足"}' }).scope, 'provider')
+  assert.equal(classifyFailure({ status: 403, message: '403: {"code":"1058","message":"用户积分不足"}' }).scope, 'provider')
+  assert.equal(classifyFailure({ message: '您的账户余额不足，请充值后重试' }).kind, 'quota')
+  assert.equal(classifyFailure({ message: '账户已欠费，请及时续费' }).kind, 'quota')
+})

@@ -39,6 +39,7 @@ All knobs below are optional and have sensible defaults:
 | --- | --- | --- | --- |
 | `PI_CODING_AGENT_DIR` | Extension state | `~/.pi/agent` | Where health state, logs, and failure reports are stored. Only relevant if you relocated your Pi agent directory; the extension follows Pi's own convention. |
 | `PI_BIN` | Headless runner only | `pi` on `PATH` | Must point to the real `pi` executable. Legacy self-references to `pi-ccswitch-run` or `ccswitch-run` are ignored with a warning and fall back to `pi`; other invalid commands remain configuration errors. |
+| `CCSWITCH_ROUND_LIMIT_MS` | Failover | `480000` (8 minutes) | Time limit for one failover round, in milliseconds. The window restarts on each successful switch; when exceeded, switching stops and the report lists every tried model with its last error. |
 | Model scope (`/model` etc.) | Failover candidates | Full registry | When Pi has an active model scope, failover only considers models inside that scope; otherwise the full registry is used. The status bar shows which source is active. |
 | `baseUrl` metadata | Endpoint isolation | provider key | Endpoint-level platform isolation groups models by `baseUrl` (provided by CC Switch `3.20+`). Without it, isolation degrades to provider-level grouping, which still works. |
 

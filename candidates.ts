@@ -1,5 +1,5 @@
 import type { FailureClass, ModelRef, ScopedModel } from './types.ts'
-import { endpointKey, modelKey, type HealthState } from './health.ts'
+import { endpointKey, modelKey, platformKey, type HealthState } from './health.ts'
 
 export interface CandidateOptions {
   current?: ModelRef
@@ -90,7 +90,9 @@ export function chooseCandidate(models: ModelRef[], options: CandidateOptions): 
   const current = options.current
   const candidates = models.filter(model => {
     if (options.tried.has(modelKey(model)) || blocked(model, options.health)) return false
-    if (options.avoidEndpoints?.has(endpointKey(model))) return false
+    // avoidEndpoints 同时支持 endpointKey（含 provider，旧语义）与 platformKey（仅 BaseURL）两种 key：
+    // 本轮隔离按平台（platformKey）归组，同平台的 provider 副本一并跳过
+    if (options.avoidEndpoints?.has(endpointKey(model)) || options.avoidEndpoints?.has(platformKey(model))) return false
     if (options.avoidFamilies?.has(modelFamily(model))) return false
     if (!supportsRequiredInputs(model, options.requiredInputs)) return false
     if (options.failureKind === 'context_overflow' && current && (model.contextWindow ?? 0) <= (current.contextWindow ?? 0)) return false

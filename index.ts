@@ -6,13 +6,18 @@ import { fileURLToPath } from 'node:url'
 import type { ExtensionAPI, ExtensionContext, FailureObservation, ModelRef } from './types.ts'
 import { classifyFailure, parseRetryAfter } from './classify.ts'
 import { candidateSnapshot, effectiveCandidates, chooseCandidate, multimodalCandidates, modelFamily, summarizeCandidateHealth } from './candidates.ts'
-import { HealthStore, endpointKey, modelKey, type HealthState } from './health.ts'
+import { HealthStore, endpointKey, modelKey, platformKey, type HealthState } from './health.ts'
 
 const FIRST_RESPONSE_TIMEOUT = 90_000
 const STREAM_IDLE_TIMEOUT = 120_000
-const ROUND_LIMIT = 8 * 60_000
+/** 本轮时间限制默认值；可用 CCSWITCH_ROUND_LIMIT_MS 覆盖（毫秒）。 */
+const ROUND_LIMIT_DEFAULT = 8 * 60_000
+const roundLimitMs = (): number => {
+  const override = Number(process.env.CCSWITCH_ROUND_LIMIT_MS)
+  return Number.isFinite(override) && override > 0 ? override : ROUND_LIMIT_DEFAULT
+}
 const RPC_PROTOCOL_VERSION = 1
-const EXTENSION_VERSION = '0.3.10'
+const EXTENSION_VERSION = '0.3.11'
 // 同端点（BaseURL 相同）连续失败达到该次数即隔离该端点，避免同一个平台的多个模型逐个试错耗尽本轮切换
 const ENDPOINT_FAIL_THRESHOLD = 3
 
@@ -42,6 +47,8 @@ interface Round {
   avoidFamilies?: Set<string>
   /** 本轮内最后一次成功切换的时间；用于刷新 ROUND_LIMIT 窗口，避免供应商内部重试耗时导致误判“超过本轮时间限制” */
   lastSwitchAt?: number
+  /** 本轮内每个已试模型的最后错误消息（key 为 modelKey），用于 exhaust 报告 */
+  errors: Map<string, string>
 }
 
 function key(model: ModelRef | undefined): string | undefined { return model && modelKey(model) }
@@ -79,6 +86,15 @@ export default function (pi: ExtensionAPI) {
   let lastStatus: { status?: number, retryAfterMs?: number } = {}
   // 本次 pi session 内成功切换的模型数量（用于衡量插件的有效程度）
   let sessionSwitches = 0
+  // pi.setModel() 内部会 emit model_select 事件（pi core 源码 _emitModelSelect(model, previous, "set")）。
+  // 扩展自己触发的切换必须标记 selfSwitching，否则 model_select 处理器会清空本轮故障转移状态
+  // （tried/attempts/endpointFails），导致：a) exhaust 报告“已尝试”为空；b) 端点隔离被清零后
+  // 同平台候选被逐个重试，烧光 ROUND_LIMIT → “超过本轮时间限制”。
+  let selfSwitching = false
+  const setModelInternally = async (model: ModelRef): Promise<boolean> => {
+    selfSwitching = true
+    try { return await pi.setModel(model) } catch { return false } finally { selfSwitching = false }
+  }
 
   const clearWatchdog = () => { if (timer) clearTimeout(timer); timer = undefined }
   const armWatchdog = (ctx: ExtensionContext, ms: number, roundId: number) => {
@@ -175,10 +191,13 @@ export default function (pi: ExtensionAPI) {
     round.phase = 'exhausted'
     clearWatchdog()
     ctx.ui.setWorkingMessage()
-    await health.report(`# CCSwitch 自动故障转移失败\n\n时间：${new Date().toISOString()}\n原因：${reason}\n\n已尝试：\n${[...round.tried].map(item => `- ${item}`).join('\n')}\n\n可使用 /ccswitch status 查看状态，/ccswitch reactivate <provider/model> 重新激活。`)
+    // 报告列出本轮每个已试模型及其最后错误，便于直接定位是哪个 provider/模型、什么原因
+    const triedLines = [...round.tried].map(item => {
+      const error = round!.errors.get(item)
+      return error ? `- ${item} — ${error}` : `- ${item}`
+    })
+    await health.report(`# CCSwitch 自动故障转移失败\n\n时间：${new Date().toISOString()}\n原因：${reason}\n\n已尝试：\n${triedLines.join('\n')}\n\n可使用 /ccswitch status 查看状态，/ccswitch reactivate <provider/model|all> 重新激活。`)
     await health.log(`round exhausted: ${reason}; tried=${[...round.tried].join(',')}`)
-    // RPC runner relies on an explicit terminal signal instead of guessing from
-    // agent_settled. Keep this RPC-only so ordinary TUI transcripts stay quiet.
     if (ctx.mode === 'rpc') {
       const lastFailure = round.observation ? classifyFailure(round.observation).kind : undefined
       try {
@@ -190,11 +209,14 @@ export default function (pi: ExtensionAPI) {
           model: key(round.model),
           attempts: round.attempts,
           tried: [...round.tried],
+          errors: Object.fromEntries(round.errors),
           sessionSwitches,
         })
       } catch { /* reporting must not prevent the regular exhausted path */ }
     }
-    notify(ctx, `CCSwitch：自动切换停止（${reason}），请用 /ccswitch 查看详情`, 'error')
+    const currentKey = key(round.model)
+    const currentError = currentKey ? round.errors.get(currentKey) : undefined
+    notify(ctx, `CCSwitch：自动切换停止（${reason}）${currentError ? `；当前 ${currentKey}：${currentError}` : ''}，请用 /ccswitch 查看详情`, 'error')
     status(ctx)
   }
   /**
@@ -214,7 +236,7 @@ export default function (pi: ExtensionAPI) {
       return
     }
     const previousModel = current
-    const set = await pi.setModel(next).catch(() => false)
+    const set = await setModelInternally(next)
     if (!set) {
       await health.log(`modality precheck: Pi refused model selection ${modelKey(next)}`)
       notify(ctx, `CCSwitch：多模态候选 ${modelKey(next)} 切换失败，已保持原模型`, 'warning')
@@ -243,30 +265,35 @@ export default function (pi: ExtensionAPI) {
 
   const failover = async (ctx: ExtensionContext) => {
     if (!round || !round.observation || !round.model || !canRetry(ctx)) return
-    // 窗口从上一次成功切换（或本轮开始）起算：供应商内部重试耗时不应消耗整轮限额
-    const windowStart = Math.max(round.startedAt, round.lastSwitchAt ?? 0)
-    if (Date.now() - windowStart >= ROUND_LIMIT) return exhaust(ctx, '超过本轮时间限制')
     const classification = classifyFailure(round.observation)
     if (round.observation.aborted && !round.observation.watchdog) { round.phase = 'idle'; clearWatchdog(); status(ctx); return }
     round.phase = 'switching'
-    round.tried.add(modelKey(round.model))
-    // 跟踪同端点失败：BaseURL 相同的模型同属一个端点平台，连续失败到阈值后隔离整个端点，
-    // 避免同一平台下的多个模型逐个试错（它们往往共享同一故障根源）
+    const failedKey = modelKey(round.model)
+    round.tried.add(failedKey)
+    round.errors.set(failedKey, round.observation.message ?? classification.kind)
+    // 跟踪同平台失败：按 BaseURL 归组（platformKey 不含 provider 名），同一平台下的多个
+    // provider/模型逐个试错会共享同一故障根源，连续失败到阈值后隔离整个平台，
+    // 避免它们烧光本轮切换时间（每个候选最多占用 FIRST_RESPONSE_TIMEOUT）
     const failTracker = round.endpointFails ??= { failed: new Map(), isolated: new Set() }
-    const ep = endpointKey(round.model)
-    const epFails = (failTracker.failed.get(ep) ?? 0) + 1
-    failTracker.failed.set(ep, epFails)
-    if (epFails >= ENDPOINT_FAIL_THRESHOLD) {
-      failTracker.isolated.add(ep)
-      await health.log(`endpoint ${ep} failed ${epFails} times this round, isolating endpoint`)
+    const platform = platformKey(round.model)
+    const platformFails = (failTracker.failed.get(platform) ?? 0) + 1
+    failTracker.failed.set(platform, platformFails)
+    if (platformFails >= ENDPOINT_FAIL_THRESHOLD) {
+      failTracker.isolated.add(platform)
+      await health.log(`platform ${platform} failed ${platformFails} times this round, isolating platform`)
     }
     if (classification.kind === 'content_policy') {
       health.recordContentPolicyConstraint(modelFamily(round.model), round.model, round.observation.message)
       round.avoidFamilies ??= new Set()
       for (const family of activePolicyFamilies(health.snapshot)) round.avoidFamilies.add(family)
     }
-    if (!classification.roundOnly && classification.scope) health.recordFailure(classification.scope, classification.scope === 'model' ? modelKey(round.model) : classification.scope === 'provider' ? round.model.provider : endpointKey(round.model), classification.kind, round.observation.message, classification.retryAfterMs)
+    // 失败必须先落台账再做时限判断：否则本轮最后一次失败不会进健康状态（无冷却），
+    // 下一轮还会重试同一个刚失败的模型/provider
+    if (!classification.roundOnly && classification.scope) health.recordFailure(classification.scope, classification.scope === 'model' ? failedKey : classification.scope === 'provider' ? round.model.provider : endpointKey(round.model), classification.kind, round.observation.message, classification.retryAfterMs)
     await health.flush()
+    // 窗口从上一次成功切换（或本轮开始）起算：供应商内部重试耗时不应消耗整轮限额
+    const windowStart = Math.max(round.startedAt, round.lastSwitchAt ?? 0)
+    if (Date.now() - windowStart >= roundLimitMs()) return exhaust(ctx, '超过本轮时间限制')
     await refresh(ctx)
     const candidates = effectiveCandidates(ctx.scopedModels, ctx.modelRegistry.getAvailable())
     const candidateOptions = () => ({
@@ -284,7 +311,7 @@ export default function (pi: ExtensionAPI) {
       round.attempts++
       ctx.ui.setWorkingMessage(`模型异常，正在切换到 ${modelKey(next)}…`)
       const previousModel = round.model
-      const set = await pi.setModel(next).catch(() => false)
+      const set = await setModelInternally(next)
       if (!set) {
         health.recordFailure('model', modelKey(next), 'model_config', 'Pi refused model selection')
         round.tried.add(modelKey(next)); await health.flush()
@@ -344,7 +371,7 @@ export default function (pi: ExtensionAPI) {
     if (event.source === 'extension') return { action: 'continue' }
     clearWatchdog()
     lastStatus = {}
-    round = { id: (round?.id ?? 0) + 1, phase: 'monitoring', startedAt: Date.now(), text: event.text, images: event.images, tried: new Set(), attempts: 0, hadTool: false, inTool: false, hadOutput: false, watchdog: false, cleanRetry: false, model: ctx.model, endpointFails: undefined, avoidFamilies: undefined }
+    round = { id: (round?.id ?? 0) + 1, phase: 'monitoring', startedAt: Date.now(), text: event.text, images: event.images, tried: new Set(), attempts: 0, hadTool: false, inTool: false, hadOutput: false, watchdog: false, cleanRetry: false, model: ctx.model, endpointFails: undefined, avoidFamilies: undefined, errors: new Map() }
     status(ctx)
     // 模态预检：输入带图片但当前模型不支持图片（非多模态）→ 主动切换到多模态模型，
     // 避免 Pi 静默剥图后模型只回答“看不到图片”（此类情况不会触发 failover）。
@@ -423,6 +450,11 @@ export default function (pi: ExtensionAPI) {
     await failover(ctx)
   })
   pi.on('model_select', (event, ctx) => {
+    // pi.setModel() 内部也会发出 model_select（pi core _emitModelSelect(source="set")）。
+    // 本扩展自己触发的切换绝不能清空本轮故障转移状态（tried/attempts/endpointFails/errors），
+    // 否则：a) exhaust 报告“已尝试”为空，用户看不到哪些 provider/model 失败过；
+    // b) 同平台隔离被清零后，同平台候选被逐个重试烧光时限 → “超过本轮时间限制”。
+    if (selfSwitching) return
     // 用户手动切换模型（TUI 模型选择器 / /model / 方向键循环）。让 ccs 跟随：
     // 更新“当前模型”并重置本轮故障转移状态，否则 round.model 停留在上一轮使用的模型，
     // 导致状态栏与后续 failover 都滞后于实际选择，直到下次 input 才偶尔纠正。

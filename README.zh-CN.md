@@ -37,6 +37,7 @@
 | --- | --- | --- | --- |
 | `PI_CODING_AGENT_DIR` | 扩展状态 | `~/.pi/agent` | 健康状态、日志与失败报告的存放目录；仅在你迁移了 Pi agent 目录时需要，插件跟随 Pi 自身约定。 |
 | `PI_BIN` | 仅 headless runner | `PATH` 中的 `pi` | 必须指向真实 `pi` 可执行文件。历史自引用值 `pi-ccswitch-run` 或 `ccswitch-run` 会警告并降级到 `pi`；其他非法命令仍按配置错误处理。 |
+| `CCSWITCH_ROUND_LIMIT_MS` | 故障转移 | `480000`（8 分钟） | 本轮故障转移的时间限制（毫秒）。窗口从本轮开始或最后一次成功切换起算；超过后停止切换并报告已试模型及最后错误。 |
 | 模型 scope（`/model` 等） | 故障转移候选 | 全量注册表 | Pi 启用了 model scope 时，只在 scope 内模型间切换；否则使用全量注册表。状态栏会显示当前数据源。 |
 | `baseUrl` 元数据 | 端点隔离 | provider key | 端点级平台隔离按 `baseUrl` 分组模型（由 CC Switch `3.20+` 提供）；缺失时退化为 provider 级分组，仍然可用。 |
 

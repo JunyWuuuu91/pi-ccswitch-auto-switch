@@ -477,3 +477,141 @@ test('tool result with image proactively switches to multimodal candidate', { co
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+// --- 回归：pi.setModel() 内部会 emit model_select（pi core _emitModelSelect(source="set")），
+// 扩展自己的切换不得清空本轮故障转移状态，否则 exhaust 报告“已尝试”为空。
+test("extension's own setModel (model_select source=set) must not wipe round failover state", { concurrency: false }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-selfswitch-'))
+  const previous = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = dir
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+  const selected: string[] = []
+  const notifications: string[] = []
+  let activeModel: ModelRef = a
+  const ctx: ExtensionContext = {
+    mode: 'tui', hasUI: true, model: a, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+    modelRegistry: { refresh: async () => {}, getAvailable: () => [a, b] },
+    ui: { notify: (msg) => { notifications.push(msg) }, setStatus: () => {}, setWorkingMessage: () => {} },
+  }
+  try {
+    extension({
+      on: (name, handler) => handlers.set(name, handler),
+      registerCommand: () => {},
+      // 模拟 pi core：setModel 成功后 emit model_select（与真实 agent-session 行为一致）
+      setModel: async model => {
+        const previousModel = activeModel
+        activeModel = model; ctx.model = model; selected.push(`${model.provider}/${model.id}`)
+        await handlers.get('model_select')?.({ model, previousModel, source: 'set' }, ctx)
+        return true
+      },
+      sendUserMessage: () => {},
+    })
+    await handlers.get('session_start')?.({}, ctx)
+    handlers.get('input')?.({ source: 'interactive', text: 'trigger' }, ctx)
+    handlers.get('after_provider_response')?.({ status: 429, headers: {} }, ctx)
+    await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: 'provider-a', model: 'coder', content: [], stopReason: 'error', errorMessage: 'rate limit' } }, ctx)
+    await handlers.get('agent_settled')?.({}, ctx)
+    assert.deepEqual(selected, ['provider-b/coder'], 'first failure switches to provider-b')
+    // provider-b 也失败（换错误消息以便区分）
+    handlers.get('after_provider_response')?.({ status: 429, headers: {} }, ctx)
+    await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: 'provider-b', model: 'coder', content: [], stopReason: 'error', errorMessage: 'rate limit 2' } }, ctx)
+    await handlers.get('agent_settled')?.({}, ctx)
+    // 两个 provider 都已冷却 → 无健康候选 → exhaust；报告必须列出两个都试过的模型
+    const report = readFileSync(join(dir, 'ccswitch-failure-report.md'), 'utf8')
+    assert.match(report, /- provider-a\/coder — rate limit/, 'report must list provider-a with its error (not wiped by model_select)')
+    assert.match(report, /- provider-b\/coder — rate limit 2/, 'report must list provider-b with its error')
+    assert.ok(notifications.some(n => n.includes('provider-b/coder')), 'exhaust notification should name the last failing model')
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+// --- 回归：同平台（同 BaseURL 不同 provider 副本）连续失败 3 次应隔离整个平台，
+// 不再把同平台剩余副本逐个试一遍（每个候选最多烧一个 FIRST_RESPONSE_TIMEOUT）。
+test('same-platform provider copies are isolated as one platform after repeated failures', { concurrency: false }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-platform-'))
+  const previous = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = dir
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+  const selected: string[] = []
+  const p1: ModelRef = { provider: 'p1', id: 'm', baseUrl: 'https://same-platform.example/v1', contextWindow: 128000, input: ['text'] }
+  const p2: ModelRef = { provider: 'p2', id: 'm', baseUrl: 'https://same-platform.example/v1', contextWindow: 128000, input: ['text'] }
+  const p3: ModelRef = { provider: 'p3', id: 'm', baseUrl: 'https://same-platform.example/v1', contextWindow: 128000, input: ['text'] }
+  const p4: ModelRef = { provider: 'p4', id: 'm', baseUrl: 'https://same-platform.example/v1', contextWindow: 128000, input: ['text'] }
+  const p5: ModelRef = { provider: 'p5', id: 'm', baseUrl: 'https://other-platform.example/v1', contextWindow: 128000, input: ['text'] }
+  let activeModel: ModelRef = p1
+  const ctx: ExtensionContext = {
+    mode: 'tui', hasUI: true, model: p1, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+    modelRegistry: { refresh: async () => {}, getAvailable: () => [p1, p2, p3, p4, p5] },
+    ui: { notify: () => {}, setStatus: () => {}, setWorkingMessage: () => {} },
+  }
+  try {
+    extension({
+      on: (name, handler) => handlers.set(name, handler),
+      registerCommand: () => {},
+      setModel: async model => { activeModel = model; ctx.model = model; selected.push(`${model.provider}/${model.id}`); return true },
+      sendUserMessage: () => {},
+    })
+    await handlers.get('session_start')?.({}, ctx)
+    handlers.get('input')?.({ source: 'interactive', text: 'trigger platform isolation' }, ctx)
+    // unknown 类失败只冷却 model 级（2min），不会阻断同平台兄弟副本 —— 只有平台隔离能跳过它们
+    const failOn = async (provider: string) => {
+      handlers.get('after_provider_response')?.({ status: 500, headers: {} }, ctx)
+      await handlers.get('turn_end')?.({ message: { role: 'assistant', provider, model: 'm', content: [], stopReason: 'error', errorMessage: 'unexpected provider exception' } }, ctx)
+      await handlers.get('agent_settled')?.({}, ctx)
+    }
+    // p1 → p2 → p3 同平台连续失败 3 次 → 平台被隔离 → 跳过同平台未试过的 p4，直接选跨平台的 p5
+    await failOn('p1')
+    await failOn('p2')
+    await failOn('p3')
+    assert.deepEqual(selected, ['p2/m', 'p3/m', 'p5/m'], 'platform isolation must skip the remaining same-platform copy p4 and pick the cross-platform p5')
+    assert.equal(activeModel.provider, 'p5', 'round continues on the cross-platform fallback')
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+// --- 回归：ROUND_LIMIT 耗尽前，最后一个失败必须先落健康台账（否则下一轮还会重试同一个刚失败的模型）
+test('final failure is recorded to health even when the round time limit is exceeded', { concurrency: false }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-timelimit-'))
+  const previous = process.env.PI_CODING_AGENT_DIR
+  process.env.CCSWITCH_ROUND_LIMIT_MS = '1'
+  process.env.PI_CODING_AGENT_DIR = dir
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+  const selected: string[] = []
+  const notifications: string[] = []
+  const ctx: ExtensionContext = {
+    mode: 'tui', hasUI: true, model: a, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+    modelRegistry: { refresh: async () => {}, getAvailable: () => [a, b] },
+    ui: { notify: (msg) => { notifications.push(msg) }, setStatus: () => {}, setWorkingMessage: () => {} },
+  }
+  try {
+    extension({
+      on: (name, handler) => handlers.set(name, handler),
+      registerCommand: () => {},
+      setModel: async model => { ctx.model = model; selected.push(`${model.provider}/${model.id}`); return true },
+      sendUserMessage: () => {},
+    })
+    await handlers.get('session_start')?.({}, ctx)
+    handlers.get('input')?.({ source: 'interactive', text: 'trigger' }, ctx)
+    handlers.get('after_provider_response')?.({ status: 429, headers: {} }, ctx)
+    await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: 'provider-a', model: 'coder', content: [], stopReason: 'error', errorMessage: 'rate limit' } }, ctx)
+    await handlers.get('agent_settled')?.({}, ctx)
+    // 1ms 轮时限 → 第一次失败即触发“超过本轮时间限制” exhaust；但失败必须已记录
+    const state = JSON.parse(readFileSync(join(dir, 'ccswitch-auto-switch-state.json'), 'utf8'))
+    assert.ok(state.providers['provider-a']?.cooldownUntil > Date.now(), 'provider failure must be recorded before the time-limit exhaust')
+    const report = readFileSync(join(dir, 'ccswitch-failure-report.md'), 'utf8')
+    assert.match(report, /- provider-a\/coder/, 'tried list must contain the failing model')
+    assert.ok(notifications.some(n => n.includes('超过本轮时间限制') && n.includes('provider-a/coder')), 'notification should name the failing model')
+    assert.deepEqual(selected, [], 'no switch should happen when the time limit is already exhausted')
+  } finally {
+    delete process.env.CCSWITCH_ROUND_LIMIT_MS
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})
