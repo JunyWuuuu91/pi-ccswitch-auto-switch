@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 import type { ExtensionAPI, ExtensionContext, FailureObservation, ModelRef } from './types.ts'
 import { classifyFailure, parseRetryAfter } from './classify.ts'
 import { candidateSnapshot, effectiveCandidates, chooseCandidate, multimodalCandidates, modelFamily, summarizeCandidateHealth } from './candidates.ts'
-import { HealthStore, endpointKey, modelKey, platformKey, type HealthState } from './health.ts'
+import { HealthStore, endpointKey, modelKey, platformKey, type ContentPolicyConstraint } from './health.ts'
 
 const FIRST_RESPONSE_TIMEOUT = 90_000
 const STREAM_IDLE_TIMEOUT = 120_000
@@ -17,7 +17,7 @@ const roundLimitMs = (): number => {
   return Number.isFinite(override) && override > 0 ? override : ROUND_LIMIT_DEFAULT
 }
 const RPC_PROTOCOL_VERSION = 1
-const EXTENSION_VERSION = '0.3.11'
+const EXTENSION_VERSION = '0.3.12'
 // 同端点（BaseURL 相同）连续失败达到该次数即隔离该端点，避免同一个平台的多个模型逐个试错耗尽本轮切换
 const ENDPOINT_FAIL_THRESHOLD = 3
 
@@ -33,6 +33,8 @@ interface Round {
   startedAt: number
   text: string
   images?: Array<Record<string, unknown>>
+  needsImage: boolean
+  modalitySwitch?: Promise<void>
   tried: Set<string>
   attempts: number
   hadTool: boolean
@@ -43,7 +45,7 @@ interface Round {
   observation?: FailureObservation
   model?: ModelRef
   endpointFails?: EndpointFailTracker
-  /** 本轮内容审查故障转移中必须避开的模型系列（包含持久化学到的约束）。 */
+  /** 本轮内容审查故障转移中必须避开的模型系列（包含本 session 学到的约束）。 */
   avoidFamilies?: Set<string>
   /** 本轮内最后一次成功切换的时间；用于刷新 ROUND_LIMIT 窗口，避免供应商内部重试耗时导致误判“超过本轮时间限制” */
   lastSwitchAt?: number
@@ -53,8 +55,8 @@ interface Round {
 
 function key(model: ModelRef | undefined): string | undefined { return model && modelKey(model) }
 function canRetry(ctx: ExtensionContext): boolean { return ctx.mode === 'tui' || ctx.mode === 'rpc' }
-function activePolicyFamilies(state: HealthState, now = Date.now()): Set<string> {
-  return new Set(Object.entries(state.contentPolicyFamilies ?? {})
+function activePolicyFamilies(constraints: Record<string, ContentPolicyConstraint>, now = Date.now()): Set<string> {
+  return new Set(Object.entries(constraints)
     .filter(([, record]) => record.avoidUntil > now)
     .map(([family]) => family))
 }
@@ -154,7 +156,7 @@ export default function (pi: ExtensionAPI) {
     const candidates = snapshot.models
     const counts = summarizeCandidateHealth(candidates, state)
     const now = Date.now()
-    const policyFamilies = activePolicyFamilies(state, now)
+    const policyFamilies = activePolicyFamilies(health.policyConstraints, now)
     const rows = candidates.slice(0, 10).map(model => {
       const modelRecord = state.models[modelKey(model)]
       const records = [modelRecord, state.providers[model.provider], state.endpoints[endpointKey(model)]]
@@ -179,7 +181,11 @@ export default function (pi: ExtensionAPI) {
     const policySummary = policyFamilies.size ? [...policyFamilies].join(', ') : '无'
     const action = await ctx.ui.select(`CCSwitch 健康面板\n当前：${key(ctx.model) ?? '无'}\n${scopeLabel} · 唯一模型：${counts.total} · 健康：${counts.healthy} · 自动冷却：${counts.cooling} · 手动禁用：${counts.disabled}\n熔断记录：${counts.breakerRecords} · 审查约束系列：${policySummary}\n${switchSummary}${switchPanel}\n${rows.join('\n') || '没有可用模型'}`, ['刷新', '重新激活当前模型', '禁用当前模型', '重置当前模型历史', '关闭'])
     if (action === '刷新') await refresh(ctx)
-    if (action === '重新激活当前模型' && ctx.model) { health.reactivate(ctx.model); await health.flush(); status(ctx); notify(ctx, '已重新激活当前模型') }
+    if (action === '重新激活当前模型' && ctx.model) {
+      const restored = await health.reactivate(ctx.model)
+      status(ctx)
+      notify(ctx, restored ? '已重新激活当前模型' : '重新激活失败，健康状态未确认保存；请查看 ccswitch-auto-switch.log', restored ? 'info' : 'error')
+    }
     if (action === '禁用当前模型' && ctx.model) { health.disable(modelKey(ctx.model), true); await health.flush(); status(ctx); notify(ctx, '已禁用当前模型', 'warning') }
     if (action === '重置当前模型历史' && ctx.model) {
       const ok = !ctx.ui.confirm || await ctx.ui.confirm('重置健康历史', `删除 ${modelKey(ctx.model)} 的记录？`)
@@ -223,12 +229,16 @@ export default function (pi: ExtensionAPI) {
    * 模态预检主动切换：当前模型不支持图片但本轮输入/工具结果带图时，
    * 主动切到一个健康的多模态候选（不等失败）。无候选时通知并保持原模型。
    */
-  const proactiveModalitySwitch = async (ctx: ExtensionContext, round: Round): Promise<void> => {
+  const performModalitySwitch = async (ctx: ExtensionContext, round: Round): Promise<void> => {
     const current = round.model ?? ctx.model
-    if (!current || !canRetry(ctx) || round.phase !== 'monitoring') return
+    if (!current || !canRetry(ctx) || !['monitoring', 'verifying'].includes(round.phase)) return
     if (current.input?.includes('image')) return
     const candidates = effectiveCandidates(ctx.scopedModels, ctx.modelRegistry.getAvailable())
-    const next = multimodalCandidates(candidates, current, health.snapshot)[0]
+    let next: ModelRef | undefined
+    for (const candidate of multimodalCandidates(candidates, current, health.snapshot)) {
+      if (round.tried.has(modelKey(candidate)) || round.avoidFamilies?.has(modelFamily(candidate)) || round.endpointFails?.isolated.has(platformKey(candidate))) continue
+      if (await health.claimCandidate(candidate)) { next = candidate; break }
+    }
     if (!next) {
       await health.log(`modality precheck: no multimodal candidate, staying on ${modelKey(current)}`)
       notify(ctx, 'CCSwitch：当前模型不支持图片，且没有可用的多模态候选模型，已保持原模型', 'warning')
@@ -263,6 +273,14 @@ export default function (pi: ExtensionAPI) {
     status(ctx)
   }
 
+  const proactiveModalitySwitch = (ctx: ExtensionContext, target: Round): Promise<void> => {
+    // Concurrent tool completions await the same switch before returning to Pi.
+    if (!target.modalitySwitch) {
+      target.modalitySwitch = performModalitySwitch(ctx, target).finally(() => { target.modalitySwitch = undefined })
+    }
+    return target.modalitySwitch
+  }
+
   const failover = async (ctx: ExtensionContext) => {
     if (!round || !round.observation || !round.model || !canRetry(ctx)) return
     const classification = classifyFailure(round.observation)
@@ -285,7 +303,7 @@ export default function (pi: ExtensionAPI) {
     if (classification.kind === 'content_policy') {
       health.recordContentPolicyConstraint(modelFamily(round.model), round.model, round.observation.message)
       round.avoidFamilies ??= new Set()
-      for (const family of activePolicyFamilies(health.snapshot)) round.avoidFamilies.add(family)
+      for (const family of activePolicyFamilies(health.policyConstraints)) round.avoidFamilies.add(family)
     }
     // 失败必须先落台账再做时限判断：否则本轮最后一次失败不会进健康状态（无冷却），
     // 下一轮还会重试同一个刚失败的模型/provider
@@ -303,11 +321,11 @@ export default function (pi: ExtensionAPI) {
       health: health.snapshot,
       avoidEndpoints: failTracker.isolated,
       avoidFamilies: round!.avoidFamilies,
-      requiredInputs: round!.images?.length ? ['text', 'image'] : ['text'],
+      requiredInputs: round!.needsImage ? ['text', 'image'] : ['text'],
     })
     let next = chooseCandidate(candidates, candidateOptions())
     while (next) {
-      if (!await health.claimProvider(next)) { round.tried.add(modelKey(next)); next = chooseCandidate(candidates, candidateOptions()); continue }
+      if (!await health.claimCandidate(next)) { round.tried.add(modelKey(next)); next = chooseCandidate(candidates, candidateOptions()); continue }
       round.attempts++
       ctx.ui.setWorkingMessage(`模型异常，正在切换到 ${modelKey(next)}…`)
       const previousModel = round.model
@@ -371,14 +389,20 @@ export default function (pi: ExtensionAPI) {
     if (event.source === 'extension') return { action: 'continue' }
     clearWatchdog()
     lastStatus = {}
-    round = { id: (round?.id ?? 0) + 1, phase: 'monitoring', startedAt: Date.now(), text: event.text, images: event.images, tried: new Set(), attempts: 0, hadTool: false, inTool: false, hadOutput: false, watchdog: false, cleanRetry: false, model: ctx.model, endpointFails: undefined, avoidFamilies: undefined, errors: new Map() }
+    round = { id: (round?.id ?? 0) + 1, phase: 'monitoring', startedAt: Date.now(), text: event.text, images: event.images, needsImage: Boolean(event.images?.length), tried: new Set(), attempts: 0, hadTool: false, inTool: false, hadOutput: false, watchdog: false, cleanRetry: false, model: ctx.model, endpointFails: undefined, avoidFamilies: undefined, errors: new Map() }
     status(ctx)
     // 模态预检：输入带图片但当前模型不支持图片（非多模态）→ 主动切换到多模态模型，
     // 避免 Pi 静默剥图后模型只回答“看不到图片”（此类情况不会触发 failover）。
     if (event.images?.length && round.phase === 'monitoring') await proactiveModalitySwitch(ctx, round)
     return { action: 'continue' }
   })
-  pi.on('before_provider_request', (_event, ctx) => { lastStatus = {}; if (round) { round.inTool = false; armWatchdog(ctx, FIRST_RESPONSE_TIMEOUT, round.id) } })
+  pi.on('before_provider_request', (_event, ctx) => {
+    lastStatus = {}
+    if (round) {
+      round.inTool = false
+      armWatchdog(ctx, FIRST_RESPONSE_TIMEOUT, round.id)
+    }
+  })
   pi.on('after_provider_response', (event, ctx) => {
     lastStatus = { status: event.status, retryAfterMs: parseRetryAfter(event.headers?.['retry-after']) }
     if (round && event.status >= 200 && event.status < 300) armWatchdog(ctx, STREAM_IDLE_TIMEOUT, round.id)
@@ -401,7 +425,10 @@ export default function (pi: ExtensionAPI) {
     round.inTool = false
     // 工具结果含图片（如 read 图片文件）且当前模型不支持 → 主动切换多模态模型，
     // 确保下一轮 LLM 调用使用新模型，工具结果中的图片不被 Pi 静默剥除。
-    if (round.phase === 'monitoring' && resultContainsImage(_event.result)) await proactiveModalitySwitch(ctx, round)
+    if (resultContainsImage(_event.result)) {
+      round.needsImage = true
+      await proactiveModalitySwitch(ctx, round)
+    }
   })
   pi.on('turn_end', async (event, ctx) => {
     const message = event.message
@@ -483,9 +510,11 @@ export default function (pi: ExtensionAPI) {
     if (!target && verb !== 'reset') { notify(ctx, '请指定 provider/model 或 all', 'warning'); return }
     if (verb === 'disable' && target) { health.disable(target, true); await health.flush(); status(ctx); return }
     if (verb === 'reactivate' && target) {
-      if (target === 'all') health.reactivateAll()
-      else { const [provider, ...rest] = target.split('/'); health.reactivate({ provider, id: rest.join('/') }) }
-      await health.flush(); status(ctx); return
+      const [provider, ...rest] = target.split('/')
+      const restored = await (target === 'all' ? health.reactivateAll() : health.reactivate({ provider, id: rest.join('/') }))
+      status(ctx)
+      notify(ctx, restored ? '已重新激活' : '重新激活失败，健康状态未确认保存；请查看 ccswitch-auto-switch.log', restored ? 'info' : 'error')
+      return
     }
     if (verb === 'reset' && target) {
       const ok = !ctx.ui.confirm || await ctx.ui.confirm('重置健康历史', `删除 ${target} 的健康记录？`)
@@ -499,7 +528,7 @@ export default function (pi: ExtensionAPI) {
     const snapshot = candidateSnapshot(ctx.scopedModels, ctx.modelRegistry.getAvailable())
     const counts = summarizeCandidateHealth(snapshot.models, health.snapshot)
     const state = health.snapshot
-    const policyFamilies = activePolicyFamilies(state)
+    const policyFamilies = activePolicyFamilies(health.policyConstraints)
     const source = snapshot.source === 'scoped' ? `Pi scope ${snapshot.sourceEntries} 条` : `Pi 注册表 ${snapshot.sourceEntries} 条`
     notify(ctx, `CCSwitch 自检：${source} · 唯一模型 ${counts.total} · 健康 ${counts.healthy} · 自动冷却 ${counts.cooling} · 手动禁用 ${counts.disabled} · 熔断记录 ${counts.breakerRecords} · 审查约束系列 ${policyFamilies.size} · 本session切换 ${sessionSwitches} · 累计切换 ${state.switches ?? 0}`, counts.total ? 'info' : 'warning')
   }})

@@ -13,7 +13,7 @@ The extension observes real Pi requests, records sanitized health signals, and�
 - Endpoint circuit breakers for DNS, connection, server, and streaming failures.
 - Endpoint platform isolation: when several models on the same endpoint (same BaseURL/provider) fail within one round, the whole endpoint is isolated so sibling models from the same platform are not tried one by one.
 - Model-only isolation for missing models and incompatible parameters.
-- Learns model-family content-policy constraints from real failures (`glm-4.5` and `GLM-4.6`, for example, are both `glm`) and avoids the entire family during the current content-policy failover chain. Evidence is session-scoped: it is cleared at `session_start`, because a new session may handle tasks that are not content-sensitive, so the family becomes eligible again until this session observes its own content-policy rejection.
+- Learns model-family content-policy constraints from real failures (`glm-4.5` and `GLM-4.6`, for example, are both `glm`) and avoids the entire family during the current content-policy failover chain. Evidence lives only in the owning extension instance, is never written to shared health state, and is cleared at that instance’s `session_start`, because a new session may handle tasks that are not content-sensitive, so the family becomes eligible again until this session observes its own content-policy rejection.
 - Applies hard health, failure-domain, policy-family, input-modality, and context filters before ranking candidates by provider diversity, model equivalence, capability compatibility, and historical reliability.
   - Independent-provider semantics: a copied vendor (e.g. `my-provider-copy`) shares the BaseURL but is a distinct provider with its own endpoint key, so isolating one never blocks the other.
 - 90-second first-response and 120-second streaming-idle watchdogs.
@@ -160,6 +160,7 @@ CCSwitch therefore prechecks **before the request is sent**, instead of waiting 
 
 - When user input carries images (`input` event with `images`), CCSwitch immediately switches to a healthy multimodal candidate (`input` explicitly includes `image`) before the request is processed, so the images are preserved;
 - When a tool execution returns images (e.g. the `read` tool loading an image file, whose result content includes `image` parts), CCSwitch also switches to a multimodal model before the next LLM call, so the tool-result images are not stripped;
+- Image requirements remain active for the entire failover round, including images returned by tools during retry verification and later fallback attempts;
 - Only models that **explicitly** support images (`input` includes `image`) are considered; models with missing metadata are never assumed to support images;
 - The switch reason is recorded as `modality` and counted in both the session and lifetime switch counters;
 - If no multimodal candidate is available, CCSwitch notifies the user and keeps the current model (Pi will still strip the image and add its notice).
@@ -168,7 +169,9 @@ The modality precheck applies only in interactive TUI/RPC sessions (the same sco
 
 ## Data and privacy
 
-Health state is stored in Pi's agent directory as `ccswitch-auto-switch-state.json`. The extension stores counters, timestamps, cooldowns, learned model-family policy constraints, and redacted/truncated error summaries. It does not access credentials, authorization headers, CC Switch's database, or Pi's `auth.json`.
+Health state is stored in Pi's agent directory as `ccswitch-auto-switch-state.json`. The extension stores counters, timestamps, cooldowns, and redacted/truncated error summaries. Model-family policy constraints stay in session memory. It does not access credentials, authorization headers, CC Switch's database, or Pi's `auth.json`.
+
+State schema 3 loads schema 2 health records and preserves their existing totals as a shared baseline. Per-writer counters merge independent increments without counting repeated merges twice. Older releases cannot read schema 3 and cannot be made safe by code in a newer process. **Do not run schema-2 and schema-3 releases together against the same directory.** Before upgrading: (1) stop every old Pi process and scheduled runner using the same `PI_CODING_AGENT_DIR`; (2) back up `ccswitch-auto-switch-state.json` while they are stopped; (3) upgrade every installation that uses that directory; (4) restart only the upgraded processes. A running current-version store refuses writes when it encounters an unsupported schema or observes a downgrade from 3 to 2, preserves the file, and logs the reason in `ccswitch-auto-switch.log`. This cannot undo damage already caused by old code; the stop/upgrade/restart sequence is required. Manual enable/disable operations use monotonic local timestamps; merge picks the newer operation, with disable winning an exact timestamp tie (including conflicting legacy values without timestamps). Reset barriers prevent stale snapshots from restoring cleared records. Counter metadata grows with the number of writer instances that record failures or switches.
 
 ## Development
 
@@ -178,7 +181,7 @@ npm run typecheck
 npm test
 ```
 
-Tests use Node's built-in test runner and cover the failure matrix, family-level policy avoidance, provider-first selection, input compatibility, cooldowns, state persistence, and Windows-compatible paths.
+TypeScript is an explicit development dependency. `npm test` enables Node’s native TypeScript stripping and runs all `health`, `integration`, `logic`, and `runner` suites on Node 22.19+. Tests use Node's built-in test runner and cover the failure matrix, family-level policy avoidance, provider-first selection, input compatibility, cooldowns, state persistence, and Windows-compatible paths.
 
 ## License
 

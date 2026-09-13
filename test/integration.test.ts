@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -188,18 +188,16 @@ test('content_policy failure switches to another model and records health', { co
     await handlers.get('agent_settled')?.({}, ctx)
     assert.deepEqual(selected, ['provider-c/qwen3-coder'], 'content policy should skip the entire rejected model family')
 
-    // 新一轮内容审查故障转移仍会加载持久化的 glm 约束，同时累计本轮新发现的 qwen 约束。
+    // 新一轮内容审查故障转移仍会读取本 session 的 glm 约束，同时累计本轮新发现的 qwen 约束。
     handlers.get('input')?.({ source: 'interactive', text: 'ask another sensitive question' }, ctx)
     handlers.get('after_provider_response')?.({ status: 200, headers: {} }, ctx)
     await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: unrestricted.provider, model: unrestricted.id, content: [], stopReason: 'error', errorMessage: 'content_filter' } }, ctx)
     await handlers.get('agent_settled')?.({}, ctx)
     assert.deepEqual(selected, ['provider-c/qwen3-coder', 'provider-d/claude-sonnet'], 'later policy failover should keep avoiding previously learned GLM models')
-    // 台账应记录 model 级失败（冷却）以及系列级审查约束。
+    // 台账只记录 model 级失败（冷却），系列约束保留在 session 内存。
     const state = JSON.parse(readFileSync(join(dir, 'ccswitch-auto-switch-state.json'), 'utf8'))
     assert.ok(state.models['provider-a/glm-4.5']?.cooldownUntil > Date.now(), 'model should be cooling after content policy failure')
-    assert.equal(state.contentPolicyFamilies?.glm?.lastModel, 'provider-a/glm-4.5')
-    assert.ok(state.contentPolicyFamilies?.glm?.avoidUntil > Date.now())
-    assert.equal(state.contentPolicyFamilies?.qwen?.lastModel, 'provider-c/qwen3-coder')
+    assert.equal(state.contentPolicyFamilies, undefined, 'policy families must not be persisted')
     assert.equal(state.switches, 2)
   } finally {
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
@@ -402,8 +400,10 @@ test('input with images but no multimodal candidate does nothing', { concurrency
     assert.deepEqual(selected, [], 'should NOT switch when no multimodal candidate')
     assert.ok(notifications.some(n => n.includes('没有可用的多模态候选') || n.includes('无可用的多模态候选')), 'should notify user about no multimodal candidate')
     assert.equal(activeModel.provider, 'provider-a')
-    const state = JSON.parse(readFileSync(join(dir, 'ccswitch-auto-switch-state.json'), 'utf8'))
-    assert.equal(state.switches ?? 0, 0, 'no switch should have occurred')
+    const { HealthStore } = await import('../health.ts')
+    const store = new HealthStore(dir)
+    await store.load()
+    assert.equal(store.snapshot.switches ?? 0, 0, 'no switch should have occurred')
   } finally {
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
     else process.env.PI_CODING_AGENT_DIR = previous
@@ -576,7 +576,9 @@ test('same-platform provider copies are isolated as one platform after repeated 
 })
 
 // --- 回归：ROUND_LIMIT 耗尽前，最后一个失败必须先落健康台账（否则下一轮还会重试同一个刚失败的模型）
-test('final failure is recorded to health even when the round time limit is exceeded', { concurrency: false }, async () => {
+test('final failure is recorded to health even when the round time limit is exceeded', { concurrency: false }, async t => {
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
   const dir = await mkdtemp(join(tmpdir(), 'ccswitch-timelimit-'))
   const previous = process.env.PI_CODING_AGENT_DIR
   process.env.CCSWITCH_ROUND_LIMIT_MS = '1'
@@ -598,6 +600,7 @@ test('final failure is recorded to health even when the round time limit is exce
     })
     await handlers.get('session_start')?.({}, ctx)
     handlers.get('input')?.({ source: 'interactive', text: 'trigger' }, ctx)
+    now += 2 // deterministic expiry; do not depend on filesystem latency
     handlers.get('after_provider_response')?.({ status: 429, headers: {} }, ctx)
     await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: 'provider-a', model: 'coder', content: [], stopReason: 'error', errorMessage: 'rate limit' } }, ctx)
     await handlers.get('agent_settled')?.({}, ctx)
@@ -615,3 +618,176 @@ test('final failure is recorded to health even when the round time limit is exce
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+for (const source of ['input', 'tool', 'retry-tool']) {
+  test(`image requirements survive subsequent failures: ${source}`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ccswitch-image-round-'))
+    const previous = process.env.PI_CODING_AGENT_DIR
+    process.env.PI_CODING_AGENT_DIR = dir
+    const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+    const models: ModelRef[] = [
+      { provider: 'a', id: 'coder', input: ['text'] },
+      { provider: 'b', id: 'coder', input: ['text'] },
+      { provider: 'c', id: 'vision', input: ['text', 'image'] },
+      { provider: 'd', id: 'vision', input: ['text', 'image'] },
+      { provider: 'e', id: 'unknown' },
+    ]
+    const selected: string[] = []
+    const ctx: ExtensionContext = {
+      mode: 'rpc', hasUI: false, model: models[0], scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+      modelRegistry: { refresh: async () => {}, getAvailable: () => models },
+      ui: { notify: () => {}, setStatus: () => {}, setWorkingMessage: () => {} },
+    }
+    const fail = async () => {
+      await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: ctx.model!.provider, model: ctx.model!.id, stopReason: 'error', errorMessage: 'unknown failure', content: [] } }, ctx)
+      await handlers.get('agent_settled')?.({}, ctx)
+    }
+    try {
+      extension({ on: (name, handler) => handlers.set(name, handler), registerCommand: () => {},
+        setModel: async model => { await Promise.resolve(); ctx.model = model; selected.push(model.provider); return true }, sendUserMessage: () => {} })
+      await handlers.get('session_start')?.({}, ctx)
+      await handlers.get('input')?.({ source: 'rpc', text: 'read image', images: source === 'input' ? [{ type: 'image', data: 'mock' }] : undefined }, ctx)
+      if (source === 'retry-tool') { await fail(); assert.equal(ctx.model?.provider, 'b') }
+      if (source !== 'input') {
+        await handlers.get('tool_execution_start')?.({}, ctx)
+        // Parallel tools may complete together; they must share one switch.
+        const toolsFinished = Promise.all([1, 2].map(() => handlers.get('tool_execution_end')?.({ result: { content: [{ type: 'image', data: 'mock' }] } }, ctx)))
+        await toolsFinished
+        assert.equal(ctx.model?.provider, 'c', 'awaited tool completion must select vision before request preparation')
+        const preparedModel = ctx.model
+        const selectionCount = selected.length
+        await handlers.get('before_provider_request')?.({}, ctx)
+        assert.equal(ctx.model, preparedModel)
+        assert.equal(selected.length, selectionCount, 'before-provider must not switch a prepared request')
+      }
+      assert.equal(ctx.model?.provider, 'c')
+      assert.equal(selected.filter(p => p === 'c').length, 1)
+      await fail()
+      assert.equal(ctx.model?.provider, 'd', 'next failure must still choose a vision model')
+      await fail()
+      assert.equal(ctx.model?.provider, 'd', 'unknown metadata and text-only models cannot handle remaining image round')
+    } finally {
+      await handlers.get('session_shutdown')?.({}, ctx)
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+}
+
+test('starting another extension session cannot clear local policy families', { concurrency: false }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-session-policy-'))
+  const previous = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = dir
+  const models: ModelRef[] = [
+    { provider: 'a', id: 'glm-4.5', input: ['text'] },
+    { provider: 'b', id: 'glm-4.6', input: ['text'] },
+    { provider: 'c', id: 'qwen3', input: ['text'] },
+    { provider: 'd', id: 'claude-sonnet', input: ['text'] },
+  ]
+  const makeSession = () => {
+    const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+    const commands = new Map<string, any>()
+    const messages: string[] = []
+    const ctx: ExtensionContext = {
+      mode: 'rpc', hasUI: true, model: models[0], scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+      modelRegistry: { refresh: async () => {}, getAvailable: () => models },
+      ui: { notify: message => messages.push(message), setStatus: () => {}, setWorkingMessage: () => {} },
+    }
+    extension({ on: (name, handler) => handlers.set(name, handler), registerCommand: (name, command) => commands.set(name, command),
+      setModel: async model => { ctx.model = model; return true }, sendUserMessage: () => {} })
+    return { handlers, commands, messages, ctx }
+  }
+  const a = makeSession(), b = makeSession()
+  const emit = async (session: ReturnType<typeof makeSession>, event: string, data = {}) => session.handlers.get(event)?.(data, session.ctx)
+  const reject = async (session: ReturnType<typeof makeSession>) => {
+    await emit(session, 'input', { source: 'rpc', text: 'question' })
+    await emit(session, 'turn_end', { message: { role: 'assistant', provider: session.ctx.model!.provider, model: session.ctx.model!.id, stopReason: 'error', errorMessage: 'content_filter', content: [] } })
+    await emit(session, 'agent_settled')
+  }
+  try {
+    await emit(a, 'session_start'); await reject(a)
+    assert.equal(a.ctx.model?.provider, 'c')
+    await emit(b, 'session_start')
+    await a.commands.get('ccswitch').handler('status', a.ctx)
+    assert.match(a.messages.at(-1)!, /审查约束系列 1/)
+    await b.commands.get('ccswitch-test').handler('', b.ctx)
+    assert.match(b.messages.at(-1)!, /审查约束系列 0/)
+    await reject(a)
+    assert.equal(a.ctx.model?.provider, 'd', 'session A still avoids healthy GLM sibling after session B starts')
+    await emit(a, 'session_start')
+    await a.commands.get('ccswitch-test').handler('', a.ctx)
+    assert.match(a.messages.at(-1)!, /审查约束系列 0/)
+  } finally {
+    await emit(a, 'session_shutdown'); await emit(b, 'session_shutdown')
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('before-provider never starts a late switch when vision appears after input', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-no-late-switch-'))
+  const previous = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = dir
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+  const vision: ModelRef = { provider: 'vision', id: 'vision', input: ['text', 'image'] }
+  let available = [a], switches = 0
+  const ctx: ExtensionContext = { mode: 'rpc', hasUI: false, model: a, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+    modelRegistry: { refresh: async () => {}, getAvailable: () => available },
+    ui: { notify: () => {}, setStatus: () => {}, setWorkingMessage: () => {} } }
+  try {
+    extension({ on: (name, handler) => handlers.set(name, handler), registerCommand: () => {}, sendUserMessage: () => {},
+      setModel: async model => { ctx.model = model; switches++; return true } })
+    await handlers.get('session_start')?.({}, ctx)
+    await handlers.get('input')?.({ source: 'rpc', text: 'image', images: [{ type: 'image', data: 'mock' }] }, ctx)
+    available = [a, vision]
+    await handlers.get('before_provider_request')?.({}, ctx)
+    assert.equal(switches, 0)
+    assert.equal(ctx.model, a)
+  } finally {
+    await handlers.get('session_shutdown')?.({}, ctx)
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+for (const surface of ['panel', 'command-model', 'command-all']) {
+  for (const unsupported of [false, true]) {
+    test(`recovery ${surface} reports persisted result (unsupported=${unsupported})`, async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'ccswitch-recovery-ui-'))
+      const previous = process.env.PI_CODING_AGENT_DIR
+      process.env.PI_CODING_AGENT_DIR = dir
+      const handlers = new Map<string, any>(), commands = new Map<string, any>()
+      const notices: Array<{ message: string, type: string | undefined }> = []
+      const file = join(dir, 'ccswitch-auto-switch-state.json')
+      const ctx: ExtensionContext = { mode: 'tui', hasUI: true, model: a, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+        modelRegistry: { refresh: async () => {}, getAvailable: () => [a] },
+        ui: { setStatus: () => {}, setWorkingMessage: () => {}, select: async () => '重新激活当前模型',
+          notify: (message, type) => {
+            notices.push({ message, type })
+            if (message.startsWith('已重新激活')) {
+              const state = JSON.parse(readFileSync(file, 'utf8'))
+              assert.equal(state.providers[a.provider].cooldownUntil, undefined, 'success notification must follow disk commit')
+            }
+          } } }
+      try {
+        extension({ on: (name, handler) => handlers.set(name, handler), registerCommand: (name, command) => commands.set(name, command),
+          setModel: async () => true, sendUserMessage: () => {} })
+        await handlers.get('session_start')({}, ctx)
+        const original = JSON.stringify({ schemaVersion: unsupported ? 99 : 3, updatedAt: 0, models: {}, endpoints: {},
+          providers: { [a.provider]: { consecutiveFailures: 1, totalFailures: 1, cooldownUntil: Date.now() + 60000 } } })
+        await writeFile(file, original)
+        const args = surface === 'panel' ? 'status' : surface === 'command-all' ? 'reactivate all' : `reactivate ${a.provider}/${a.id}`
+        await commands.get('ccswitch').handler(args, ctx)
+        if (unsupported) {
+          assert.ok(notices.some(n => n.type === 'error' && n.message.includes('重新激活失败')))
+          assert.equal(notices.some(n => n.message.startsWith('已重新激活')), false)
+          assert.equal(readFileSync(file, 'utf8'), original)
+        } else assert.ok(notices.some(n => n.message.startsWith('已重新激活')))
+      } finally {
+        await handlers.get('session_shutdown')?.({}, ctx)
+        if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous
+        await rm(dir, { recursive: true, force: true })
+      }
+    })
+  }
+}

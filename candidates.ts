@@ -131,7 +131,9 @@ export function modelFamily(model: Pick<ModelRef, 'id' | 'name'>): string {
 }
 
 function supportsRequiredInputs(candidate: ModelRef, required: readonly string[] | undefined): boolean {
-  if (!required?.length || !candidate.input?.length) return true
+  if (!required?.length) return true
+  if (required.includes('image') && !candidate.input?.includes('image')) return false
+  if (!candidate.input?.length) return true
   return required.every(input => candidate.input!.includes(input))
 }
 

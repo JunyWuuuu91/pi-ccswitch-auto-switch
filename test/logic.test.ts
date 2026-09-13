@@ -167,6 +167,22 @@ test('classifies Chinese quota/balance errors as provider quota', () => {
   assert.equal(classifyFailure({ message: '403: {"code":"1058","message":"用户积分不足"}' }).kind, 'quota')
   assert.equal(classifyFailure({ message: '403: {"code":"1058","message":"用户积分不足"}' }).scope, 'provider')
   assert.equal(classifyFailure({ status: 403, message: '403: {"code":"1058","message":"用户积分不足"}' }).scope, 'provider')
+  assert.equal(classifyFailure({ status: 403, message: '403: {"code":"1058","message":"用户积分不足"}' }).kind, 'quota')
   assert.equal(classifyFailure({ message: '您的账户余额不足，请充值后重试' }).kind, 'quota')
   assert.equal(classifyFailure({ message: '账户已欠费，请及时续费' }).kind, 'quota')
+})
+
+test('image-required rounds reject missing and empty input metadata', () => {
+  for (const input of [undefined, [], ['text']]) {
+    assert.equal(chooseCandidate([{ ...b, input }], { health, tried: new Set(), requiredInputs: ['text', 'image'] }), undefined)
+  }
+  assert.ok(chooseCandidate([{ ...b, input: undefined }], { health, tried: new Set(), requiredInputs: ['text'] }))
+})
+
+test('403 quota bodies outrank auth while plain forbidden stays auth', () => {
+  for (const message of ['用户积分不足', '余额不足', 'quota exceeded', 'insufficient balance', 'balance exhausted', 'not enough credits']) {
+    assert.deepEqual(classifyFailure({ status: 403, message }), { kind: 'quota', scope: 'provider', roundOnly: false })
+  }
+  assert.equal(classifyFailure({ status: 403, message: 'forbidden' }).kind, 'auth')
+  assert.equal(classifyFailure({ status: 401, message: 'unauthorized' }).kind, 'auth')
 })

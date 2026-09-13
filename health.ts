@@ -15,12 +15,15 @@ const MAX_LOG_BYTES = 512 * 1024
 export interface HealthRecord {
   consecutiveFailures: number
   totalFailures: number
+  /** Per-writer grow-only counters; legacy totals form one shared baseline. */
+  failureCounts?: Record<string, number>
   lastFailureAt?: number
   lastSuccessAt?: number
   cooldownUntil?: number
   lastClass?: FailureClass
   lastError?: string
   disabled?: boolean
+  disabledUpdatedAt?: number
   leaseUntil?: number
 }
 
@@ -33,18 +36,22 @@ export interface ContentPolicyConstraint {
 }
 
 export interface HealthState {
-  schemaVersion: 2
+  schemaVersion: 2 | 3
   updatedAt: number
+  /** Reset barriers prevent older snapshots from resurrecting cleared history. */
+  resetAt?: number
+  modelResetAt?: Record<string, number>
   models: Record<string, HealthRecord>
   providers: Record<string, HealthRecord>
   endpoints: Record<string, HealthRecord>
   /**
-   * 已从真实失败中学到的模型系列内容审查约束。它不会影响普通故障选模，只在本轮已经
-   * 发生 content_policy 失败时用于避开同类系列。
+   * Legacy schema-2 field: ignored on load and removed on the next write.
+   * Active policy constraints live only in the owning HealthStore instance.
    */
   contentPolicyFamilies?: Record<string, ContentPolicyConstraint>
   /** 累计成功切换次数（跨 session 持久化，用于衡量扩展有效程度） */
   switches?: number
+  switchCounts?: Record<string, number>
   /** 最近成功切换日志（有限条，环形保留） */
   switchLog?: Array<{
     at: number
@@ -87,7 +94,7 @@ function safeEndpoint(value: string): string {
 }
 
 function blank(): HealthState {
-  return { schemaVersion: 2, updatedAt: Date.now(), models: {}, providers: {}, endpoints: {}, contentPolicyFamilies: {}, switches: 0, switchLog: [] }
+  return { schemaVersion: 3, updatedAt: Date.now(), models: {}, providers: {}, endpoints: {}, switches: 0, switchLog: [] }
 }
 
 function redact(text: string | undefined): string | undefined {
@@ -113,30 +120,29 @@ export class HealthStore {
   readonly dir: string
   private state: HealthState = blank()
   private dirty = false
-  private replaceOnFlush = false
-  private resetModels = new Set<string>()
-  /** 合并磁盘状态后仍需强制清空的审查约束（session 边界） */
-  private clearContentPolicyOnFlush = false
+  private readonly writer = randomUUID()
+  private manualClock = 0
+  private writeBlocked = false
+  private observedSchema3 = false
+  private constraints: Record<string, ContentPolicyConstraint> = {}
 
   constructor(dir = agentDir()) { this.dir = dir }
   get file(): string { return join(this.dir, STATE_FILE) }
   get snapshot(): HealthState { return structuredClone(this.state) }
+  get policyConstraints(): Record<string, ContentPolicyConstraint> { return structuredClone(this.constraints) }
 
   async load(): Promise<void> {
     await mkdir(this.dir, { recursive: true })
     try {
-      if (existsSync(this.file)) {
-        const parsed = JSON.parse(await readFile(this.file, 'utf8')) as HealthState
-        if (parsed.schemaVersion !== 2 || !parsed.models || !parsed.providers || !parsed.endpoints) throw new Error('unsupported state schema')
-        this.state = parsed
-      } else {
-        await this.migrateLegacy()
-      }
-    } catch {
-      if (existsSync(this.file)) await rename(this.file, `${this.file}.corrupt-${Date.now()}`).catch(() => {})
-      this.state = blank()
-      this.dirty = true
-      await this.flush()
+      this.state = await this.readDisk()
+      this.writeBlocked = false
+      delete this.state.contentPolicyFamilies
+      if (!existsSync(this.file)) await this.migrateLegacy()
+    } catch (error) {
+      // Unknown/newer formats are not corruption. Keep the original in place
+      // and fail closed until an explicit successful reload repairs the state.
+      this.writeBlocked = true
+      await this.log(`health state load refused: ${String(error)}`)
     }
   }
 
@@ -163,6 +169,7 @@ export class HealthStore {
     const failures = previous.consecutiveFailures + 1
     bucket[key] = {
       ...previous, consecutiveFailures: failures, totalFailures: previous.totalFailures + 1,
+      failureCounts: incrementCounts(previous.failureCounts, previous.totalFailures, this.writer),
       lastFailureAt: Date.now(), cooldownUntil: Date.now() + cooldownMs(kind, failures, retryAfterMs),
       lastClass: kind, lastError: redact(message), leaseUntil: undefined,
     }
@@ -175,7 +182,7 @@ export class HealthStore {
    * 本 session 内再次观察到同系列审查会增加证据计数并刷新时间戳。
    */
   recordContentPolicyConstraint(family: string, model: ModelRef, message?: string): void {
-    const constraints = this.state.contentPolicyFamilies ??= {}
+    const constraints = this.constraints
     const previous = constraints[family]
     const now = Date.now()
     constraints[family] = {
@@ -185,7 +192,6 @@ export class HealthStore {
       lastModel: modelKey(model),
       lastError: redact(message),
     }
-    this.touch()
   }
 
   recordSuccess(model: ModelRef): void {
@@ -200,6 +206,7 @@ export class HealthStore {
    * 用于衡量扩展有效程度，并在 /ccswitch status 面板展示。
    */
   recordSwitch(from: string, to: string, reason?: string): void {
+    this.state.switchCounts = incrementCounts(this.state.switchCounts, this.state.switches ?? 0, this.writer)
     this.state.switches = (this.state.switches ?? 0) + 1
     const log = this.state.switchLog ?? []
     log.push({ at: Date.now(), from, to, reason })
@@ -215,35 +222,53 @@ export class HealthStore {
 
   disable(key: string, disabled: boolean): void {
     const old = this.state.models[key] ?? { consecutiveFailures: 0, totalFailures: 0 }
-    this.state.models[key] = { ...old, disabled }
+    this.state.models[key] = { ...old, disabled, disabledUpdatedAt: this.manualVersion() }
     this.touch()
   }
 
-  reactivate(model: ModelRef): void {
-    const key = modelKey(model)
-    for (const [scope, id] of [['model', key], ['provider', model.provider], ['endpoint', endpointKey(model)]] as const) {
-      const old = this.bucket(scope)[id]
-      if (old) this.bucket(scope)[id] = { ...old, disabled: false, cooldownUntil: undefined, leaseUntil: undefined, lastSuccessAt: Date.now(), consecutiveFailures: 0 }
-    }
-    this.touch()
+  async reactivate(model: ModelRef): Promise<boolean> {
+    return this.reactivateAtomically(model)
   }
 
-  reactivateAll(): void {
-    const now = Date.now()
-    for (const bucket of [this.state.models, this.state.providers, this.state.endpoints]) {
-      for (const [key, old] of Object.entries(bucket)) bucket[key] = { ...old, disabled: false, cooldownUntil: undefined, leaseUntil: undefined, lastSuccessAt: now, consecutiveFailures: 0 }
+  async reactivateAll(): Promise<boolean> {
+    return this.reactivateAtomically()
+  }
+
+  private async reactivateAtomically(model?: ModelRef): Promise<boolean> {
+    try {
+      if (this.writeBlocked) throw new Error('health state writes are blocked; reload a supported state first')
+      return await this.withLock(async () => {
+        this.state = mergeState(await this.readDisk(), this.state)
+        const disabledUpdatedAt = this.manualVersion()
+        const targets: Array<[HealthScope, string]> = model
+          ? [['model', modelKey(model)], ['provider', model.provider], ['endpoint', endpointKey(model)]]
+          : (['model', 'provider', 'endpoint'] as const).flatMap(scope => Object.keys(this.bucket(scope)).map(key => [scope, key] as [HealthScope, string]))
+        for (const [scope, key] of targets) {
+          const old = this.bucket(scope)[key]
+          if (!old) continue
+          this.bucket(scope)[key] = { ...old, disabled: false, disabledUpdatedAt,
+            cooldownUntil: undefined, leaseUntil: undefined, consecutiveFailures: 0,
+            lastSuccessAt: Math.max(Date.now(), (old.lastFailureAt ?? 0) + 1) }
+        }
+        this.touch()
+        await this.commit()
+        return true
+      })
+    } catch (error) {
+      await this.log(`reactivation refused: ${String(error)}`)
+      return false
     }
-    this.touch()
   }
 
   reset(target: string | 'all'): void {
+    const resetAt = this.manualVersion()
     if (target === 'all') {
-      this.state = blank()
-      this.replaceOnFlush = true
-      this.resetModels.clear()
+      this.clearContentPolicyConstraints()
+      this.state = { ...blank(), resetAt }
     } else {
       delete this.state.models[target]
-      this.resetModels.add(target)
+      const resets = this.state.modelResetAt ??= {}
+      resets[target] = resetAt
     }
     this.touch()
   }
@@ -253,40 +278,44 @@ export class HealthStore {
    * 对审查内容敏感，因此不在 session 间继承审查约束。
    */
   clearContentPolicyConstraints(): void {
-    this.state.contentPolicyFamilies = {}
-    this.clearContentPolicyOnFlush = true
-    this.touch()
+    this.constraints = {}
   }
 
   isBlocked(model: ModelRef, now = Date.now()): boolean {
+    if (this.writeBlocked) return true
     return [this.state.models[modelKey(model)], this.state.providers[model.provider], this.state.endpoints[endpointKey(model)]]
       .some(record => Boolean(record?.disabled || (record?.cooldownUntil && record.cooldownUntil > now) || (record?.leaseUntil && record.leaseUntil > now)))
   }
 
-  async claimProvider(model: ModelRef): Promise<boolean> {
-    const key = model.provider
-    let claimed = true
+  async claimCandidate(model: ModelRef): Promise<boolean> {
+    if (this.writeBlocked) return false
+    let claimed = false
     await this.withLock(async () => {
-      if (!this.replaceOnFlush) this.state = mergeState(await this.readDisk(), this.state)
-      const record = this.state.providers[key]
-      if (!record || !(record.cooldownUntil && record.cooldownUntil <= Date.now())) return
-      if (record.leaseUntil && record.leaseUntil > Date.now()) { claimed = false; return }
-      record.leaseUntil = Date.now() + 2 * 60_000
-      this.touch()
-      await this.commit()
-    }).catch(() => { claimed = false })
+      const disk = await this.readDisk()
+      this.state = mergeState(disk, this.state)
+      const records = (state: HealthState) => [state.models[modelKey(model)], state.providers[model.provider], state.endpoints[endpointKey(model)]]
+      const now = Date.now()
+      // Check disk as well: a stale local disabled flag must never override a
+      // disable written by another process before this atomic claim.
+      if ([...records(disk), ...records(this.state)].some(record => record?.disabled || (record?.cooldownUntil ?? 0) > now || (record?.leaseUntil ?? 0) > now)) return
+      const expired = records(this.state).filter(record => record?.cooldownUntil !== undefined && record.cooldownUntil <= now)
+      if (expired.length) {
+        for (const record of expired) record!.leaseUntil = now + 2 * 60_000
+        this.touch()
+        await this.commit()
+      }
+      claimed = true
+    }).catch(async error => { claimed = false; await this.log(`candidate claim refused: ${String(error)}`) })
     return claimed
   }
 
   async flush(): Promise<void> {
-    if (!this.dirty) return
+    if (!this.dirty || this.writeBlocked) return
     await this.withLock(async () => {
-      if (!this.replaceOnFlush) this.state = mergeState(await this.readDisk(), this.state)
-      for (const key of this.resetModels) delete this.state.models[key]
-      // 必须在 merge 之后再清空：磁盘上残留的旧 session 约束不能因合并而重新出现
-      if (this.clearContentPolicyOnFlush) this.state.contentPolicyFamilies = {}
+      // Even reset-all must validate the on-disk schema before writing.
+      this.state = mergeState(await this.readDisk(), this.state)
       await this.commit()
-    }).catch(() => {})
+    }).catch(async error => { await this.log(`health state flush refused: ${String(error)}`) })
   }
 
   async log(line: string): Promise<void> {
@@ -310,20 +339,39 @@ export class HealthStore {
   private touch(): void { this.dirty = true }
   private async readDisk(): Promise<HealthState> {
     try {
-      if (!existsSync(this.file)) return blank()
-      const parsed = JSON.parse(await readFile(this.file, 'utf8')) as HealthState
-      return parsed.schemaVersion === 2 ? parsed : blank()
-    } catch { return blank() }
+      let raw: string
+      try { raw = await readFile(this.file, 'utf8') }
+      catch (error: any) { if (error?.code === 'ENOENT') return blank(); throw error }
+      const parsed = JSON.parse(raw) as HealthState
+      if (!parsed || (parsed.schemaVersion !== 2 && parsed.schemaVersion !== 3)) throw new Error(`unsupported state schema: ${parsed?.schemaVersion}`)
+      if (this.observedSchema3 && parsed.schemaVersion === 2) throw new Error('unsupported state schema downgrade: 3 -> 2; stop all old Pi processes')
+      if (!parsed.models || !parsed.providers || !parsed.endpoints) throw new Error('invalid health state buckets')
+      this.observedSchema3 ||= parsed.schemaVersion === 3
+      return parsed
+    } catch (error) {
+      this.writeBlocked = true
+      throw error
+    }
   }
+
+  private manualVersion(): number {
+    const records = [...Object.values(this.state.models), ...Object.values(this.state.providers), ...Object.values(this.state.endpoints)]
+    this.manualClock = Math.max(Date.now(), this.manualClock + 1, (this.state.resetAt ?? 0) + 1,
+      ...Object.values(this.state.modelResetAt ?? {}).map(at => at + 1),
+      ...records.map(record => (record.disabledUpdatedAt ?? 0) + 1))
+    return this.manualClock
+  }
+
   private async commit(): Promise<void> {
+    if (this.writeBlocked) throw new Error("health state writes are blocked; reload a supported state first")
+    this.state.schemaVersion = 3
+    delete this.state.contentPolicyFamilies
     this.state.updatedAt = Date.now()
     const temp = `${this.file}.tmp-${process.pid}-${randomUUID()}`
     await writeFile(temp, JSON.stringify(this.state, null, 2), 'utf8')
     await rename(temp, this.file)
+    this.observedSchema3 = true
     this.dirty = false
-    this.replaceOnFlush = false
-    this.resetModels.clear()
-    this.clearContentPolicyOnFlush = false
   }
   private bucket(scope: HealthScope): Record<string, HealthRecord> {
     return scope === 'model' ? this.state.models : scope === 'provider' ? this.state.providers : this.state.endpoints
@@ -351,10 +399,15 @@ function mergeRecord(a: HealthRecord | undefined, b: HealthRecord | undefined): 
   const lastFailureAt = Math.max(a.lastFailureAt ?? 0, b.lastFailureAt ?? 0)
   const lastSuccessAt = Math.max(a.lastSuccessAt ?? 0, b.lastSuccessAt ?? 0)
   const successWins = lastSuccessAt > lastFailureAt
+  const failureCounts = mergeCounts(a.failureCounts, a.totalFailures, b.failureCounts, b.totalFailures)
   return {
     ...newest,
-    totalFailures: Math.max(a.totalFailures, b.totalFailures),
-    disabled: b.disabled ?? a.disabled,
+    totalFailures: sumCounts(failureCounts),
+    failureCounts,
+    disabled: (a.disabledUpdatedAt ?? 0) === (b.disabledUpdatedAt ?? 0)
+      ? (a.disabled === true || b.disabled === true ? true : b.disabled ?? a.disabled)
+      : (a.disabledUpdatedAt ?? 0) > (b.disabledUpdatedAt ?? 0) ? a.disabled : b.disabled,
+    disabledUpdatedAt: Math.max(a.disabledUpdatedAt ?? 0, b.disabledUpdatedAt ?? 0) || undefined,
     lastFailureAt: lastFailureAt || undefined,
     lastSuccessAt: lastSuccessAt || undefined,
     consecutiveFailures: successWins ? 0 : Math.max(a.consecutiveFailures, b.consecutiveFailures),
@@ -373,26 +426,59 @@ function mergeBucket(a: Record<string, HealthRecord>, b: Record<string, HealthRe
 }
 
 function mergeState(a: HealthState, b: HealthState): HealthState {
-  const switches = Math.max(a.switches ?? 0, b.switches ?? 0)
+  const resetAt = Math.max(a.resetAt ?? 0, b.resetAt ?? 0)
+  a = afterGlobalReset(a, resetAt)
+  b = afterGlobalReset(b, resetAt)
+  const modelResetAt = { ...a.modelResetAt }
+  for (const [key, at] of Object.entries(b.modelResetAt ?? {})) modelResetAt[key] = Math.max(modelResetAt[key] ?? 0, at)
+  const models = mergeBucket(a.models, b.models)
+  for (const [key, at] of Object.entries(modelResetAt)) {
+    const record = mergeRecord(afterReset(a.models[key], a.modelResetAt?.[key] ?? 0, at), afterReset(b.models[key], b.modelResetAt?.[key] ?? 0, at))
+    if (record) models[key] = record
+    else delete models[key]
+  }
+  const switchCounts = mergeCounts(a.switchCounts, a.switches ?? 0, b.switchCounts, b.switches ?? 0)
+  const switches = sumCounts(switchCounts)
   // 取最近更新的 switchLog（按 at 去倒序合并，保留最新 20 条）
   const log = [...(a.switchLog ?? []), ...(b.switchLog ?? [])]
     .sort((x, y) => y.at - x.at)
     .filter((entry, index, all) => index === 0 || all[index - 1].at !== entry.at || all[index - 1].from !== entry.from || all[index - 1].to !== entry.to)
     .slice(0, 20)
-  const contentPolicyFamilies: Record<string, ContentPolicyConstraint> = {}
-  for (const family of new Set([...Object.keys(a.contentPolicyFamilies ?? {}), ...Object.keys(b.contentPolicyFamilies ?? {})])) {
-    const left = a.contentPolicyFamilies?.[family]
-    const right = b.contentPolicyFamilies?.[family]
-    if (!left) contentPolicyFamilies[family] = right!
-    else if (!right) contentPolicyFamilies[family] = left
-    else {
-      const newest = right.lastObservedAt >= left.lastObservedAt ? right : left
-      contentPolicyFamilies[family] = {
-        ...newest,
-        observations: Math.max(left.observations, right.observations),
-        avoidUntil: Math.max(left.avoidUntil, right.avoidUntil),
-      }
+  return { schemaVersion: 3, resetAt: resetAt || undefined, modelResetAt, updatedAt: Math.max(a.updatedAt ?? 0, b.updatedAt ?? 0), models, providers: mergeBucket(a.providers ?? {}, b.providers ?? {}), endpoints: mergeBucket(a.endpoints ?? {}, b.endpoints ?? {}), switchCounts, switches, switchLog: log }
+}
+
+// Each store increments only its own component. Merging the same state twice is
+// idempotent; independent increments add without inflating the backoff streak.
+function mergeCounts(a: Record<string, number> | undefined, aTotal: number, b: Record<string, number> | undefined, bTotal: number): Record<string, number> {
+  const left = a ?? { legacy: aTotal }, right = b ?? { legacy: bTotal }
+  const result = { ...left }
+  for (const [writer, count] of Object.entries(right)) result[writer] = Math.max(result[writer] ?? 0, count)
+  return result
+}
+function incrementCounts(counts: Record<string, number> | undefined, total: number, writer: string): Record<string, number> {
+  const next = { ...(counts ?? { legacy: total }) }
+  next[writer] = (next[writer] ?? 0) + 1
+  return next
+}
+function sumCounts(counts: Record<string, number>): number {
+  return Object.values(counts).reduce((sum, count) => sum + count, 0)
+}
+
+function afterReset(record: HealthRecord | undefined, sourceResetAt: number, resetAt: number): HealthRecord | undefined {
+  if (sourceResetAt >= resetAt || !record) return record
+  // A manual operation newer than the reset survives, but old health history
+  // does not. Legacy records have timestamp zero and cannot beat a reset.
+  if ((record.disabledUpdatedAt ?? 0) > resetAt) return { consecutiveFailures: 0, totalFailures: 0, disabled: record.disabled, disabledUpdatedAt: record.disabledUpdatedAt }
+  return undefined
+}
+function afterGlobalReset(state: HealthState, resetAt: number): HealthState {
+  if ((state.resetAt ?? 0) >= resetAt) return state
+  const clean = { ...blank(), resetAt }
+  for (const scope of ['models', 'providers', 'endpoints'] as const) {
+    for (const [key, record] of Object.entries(state[scope])) {
+      const kept = afterReset(record, state.resetAt ?? 0, resetAt)
+      if (kept) clean[scope][key] = kept
     }
   }
-  return { schemaVersion: 2, updatedAt: Math.max(a.updatedAt ?? 0, b.updatedAt ?? 0), models: mergeBucket(a.models ?? {}, b.models ?? {}), providers: mergeBucket(a.providers ?? {}, b.providers ?? {}), endpoints: mergeBucket(a.endpoints ?? {}, b.endpoints ?? {}), contentPolicyFamilies, switches, switchLog: log }
+  return clean
 }
