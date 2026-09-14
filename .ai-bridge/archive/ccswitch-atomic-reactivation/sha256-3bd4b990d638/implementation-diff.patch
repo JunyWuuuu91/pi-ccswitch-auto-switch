@@ -1,0 +1,1345 @@
+diff --git a/README.md b/README.md
+index 74d1f31..6228c0c 100644
+--- a/README.md
++++ b/README.md
+@@ -13,7 +13,7 @@ The extension observes real Pi requests, records sanitized health signals, and
+ - Endpoint circuit breakers for DNS, connection, server, and streaming failures.
+ - Endpoint platform isolation: when several models on the same endpoint (same BaseURL/provider) fail within one round, the whole endpoint is isolated so sibling models from the same platform are not tried one by one.
+ - Model-only isolation for missing models and incompatible parameters.
+-- Learns model-family content-policy constraints from real failures (`glm-4.5` and `GLM-4.6`, for example, are both `glm`) and avoids the entire family during the current content-policy failover chain. Evidence is session-scoped: it is cleared at `session_start`, because a new session may handle tasks that are not content-sensitive, so the family becomes eligible again until this session observes its own content-policy rejection.
++- Learns model-family content-policy constraints from real failures (`glm-4.5` and `GLM-4.6`, for example, are both `glm`) and avoids the entire family during the current content-policy failover chain. Evidence lives only in the owning extension instance, is never written to shared health state, and is cleared at that instance’s `session_start`, because a new session may handle tasks that are not content-sensitive, so the family becomes eligible again until this session observes its own content-policy rejection.
+ - Applies hard health, failure-domain, policy-family, input-modality, and context filters before ranking candidates by provider diversity, model equivalence, capability compatibility, and historical reliability.
+   - Independent-provider semantics: a copied vendor (e.g. `my-provider-copy`) shares the BaseURL but is a distinct provider with its own endpoint key, so isolating one never blocks the other.
+ - 90-second first-response and 120-second streaming-idle watchdogs.
+@@ -160,6 +160,7 @@ CCSwitch therefore prechecks **before the request is sent**, instead of waiting
+ 
+ - When user input carries images (`input` event with `images`), CCSwitch immediately switches to a healthy multimodal candidate (`input` explicitly includes `image`) before the request is processed, so the images are preserved;
+ - When a tool execution returns images (e.g. the `read` tool loading an image file, whose result content includes `image` parts), CCSwitch also switches to a multimodal model before the next LLM call, so the tool-result images are not stripped;
++- Image requirements remain active for the entire failover round, including images returned by tools during retry verification and later fallback attempts;
+ - Only models that **explicitly** support images (`input` includes `image`) are considered; models with missing metadata are never assumed to support images;
+ - The switch reason is recorded as `modality` and counted in both the session and lifetime switch counters;
+ - If no multimodal candidate is available, CCSwitch notifies the user and keeps the current model (Pi will still strip the image and add its notice).
+@@ -168,7 +169,9 @@ The modality precheck applies only in interactive TUI/RPC sessions (the same sco
+ 
+ ## Data and privacy
+ 
+-Health state is stored in Pi's agent directory as `ccswitch-auto-switch-state.json`. The extension stores counters, timestamps, cooldowns, learned model-family policy constraints, and redacted/truncated error summaries. It does not access credentials, authorization headers, CC Switch's database, or Pi's `auth.json`.
++Health state is stored in Pi's agent directory as `ccswitch-auto-switch-state.json`. The extension stores counters, timestamps, cooldowns, and redacted/truncated error summaries. Model-family policy constraints stay in session memory. It does not access credentials, authorization headers, CC Switch's database, or Pi's `auth.json`.
++
++State schema 3 loads schema 2 health records and preserves their existing totals as a shared baseline. Per-writer counters merge independent increments without counting repeated merges twice. Older releases cannot read schema 3 and cannot be made safe by code in a newer process. **Do not run schema-2 and schema-3 releases together against the same directory.** Before upgrading: (1) stop every old Pi process and scheduled runner using the same `PI_CODING_AGENT_DIR`; (2) back up `ccswitch-auto-switch-state.json` while they are stopped; (3) upgrade every installation that uses that directory; (4) restart only the upgraded processes. A running current-version store refuses writes when it encounters an unsupported schema or observes a downgrade from 3 to 2, preserves the file, and logs the reason in `ccswitch-auto-switch.log`. This cannot undo damage already caused by old code; the stop/upgrade/restart sequence is required. Manual enable/disable operations use monotonic local timestamps; merge picks the newer operation, with disable winning an exact timestamp tie (including conflicting legacy values without timestamps). Reset barriers prevent stale snapshots from restoring cleared records. Counter metadata grows with the number of writer instances that record failures or switches.
+ 
+ ## Development
+ 
+@@ -178,7 +181,7 @@ npm run typecheck
+ npm test
+ ```
+ 
+-Tests use Node's built-in test runner and cover the failure matrix, family-level policy avoidance, provider-first selection, input compatibility, cooldowns, state persistence, and Windows-compatible paths.
++TypeScript is an explicit development dependency. `npm test` enables Node’s native TypeScript stripping and runs all `health`, `integration`, `logic`, and `runner` suites on Node 22.19+. Tests use Node's built-in test runner and cover the failure matrix, family-level policy avoidance, provider-first selection, input compatibility, cooldowns, state persistence, and Windows-compatible paths.
+ 
+ ## License
+ 
+diff --git a/README.zh-CN.md b/README.zh-CN.md
+index 7c36329..a655e09 100644
+--- a/README.zh-CN.md
++++ b/README.zh-CN.md
+@@ -12,7 +12,7 @@
+ - 对认证、额度、账单和限流实施 Provider 优先熔断。
+ - 对 DNS、连接、服务端和流中断实施端点熔断。
+ - 模型不存在或参数不兼容时仅隔离该模型。
+-- 内容审查失败会学习模型系列约束（例如 `glm-4.5`、`GLM-4.6` 同属 `glm`），在本轮内容审查故障转移中避开整个受限系列。该约束按 session 隔离：`session_start` 时清除，因为新 session 处理的任务不一定涉及审查内容，模型系列恢复可用，直到本 session 再次观察到内容审查拒绝。
++- 内容审查失败会学习模型系列约束（例如 `glm-4.5`、`GLM-4.6` 同属 `glm`），在本轮内容审查故障转移中避开整个受限系列。该约束仅保存在当前扩展实例的内存中，不写入共享健康状态；当前实例的 `session_start` 只清除自身约束，因为新 session 处理的任务不一定涉及审查内容，模型系列恢复可用，直到本 session 再次观察到内容审查拒绝。
+ - 候选模型先经过健康、故障域、审查系列、输入模态和上下文窗口硬过滤，再按跨 Provider、模型等价性、能力兼容和历史稳定性排序。
+ - 首响应 90 秒、流式停滞 120 秒看门狗。
+ - 指数退避、`Retry-After` 支持和跨进程 half-open 单探针租约。
+@@ -138,7 +138,7 @@ CCS v0.3.5 ✓70/131 · ⏳61 · ⛔0 · 🔄3 · provider/model-id
+ | 内容审查/敏感拦截 | 当前模型 + 模型系列约束 | 模型冷却 2 分钟；系列约束按 session 隔离（`session_start` 时清除） |
+ | 上下文溢出 | 仅本轮 | 无 |
+ 
+-冷却时间会指数增长但有上限。发生内容审查时，插件只在审查故障转移链中避开已标记系列，普通限流、网络或模型配置故障仍可选择这些模型。上下文溢出时只会选择上下文窗口更大的模型；带图片的请求不会切到明确仅支持文本的模型。无法归类的异常按单模型故障处理并正常切换。用户主动取消是唯一不会触发故障转移的异常终止；看门狗取消会记录为超时。
++冷却时间会指数增长但有上限。发生内容审查时，插件只在审查故障转移链中避开已标记系列，普通限流、网络或模型配置故障仍可选择这些模型。上下文溢出时只会选择上下文窗口更大的模型；带图片的请求只选择显式声明支持 image 的模型。无法归类的异常按单模型故障处理并正常切换。用户主动取消是唯一不会触发故障转移的异常终止；看门狗取消会记录为超时。
+ 
+ ### 模态预检（OCR / 图片请求自动切换多模态模型）
+ 
+@@ -149,6 +149,7 @@ Pi 在把请求发给 Provider 时，会根据当前模型的 `input` 能力静
+ - **用户输入带图片时**（`input` 事件含 `images`），如果当前模型不支持图片，立即切换到健康的多模态候选（`input` 明确含 `image`）再处理，图片被保留；
+ - **工具执行返回图片时**（如 `read` 工具读取图片文件，工具结果含 `image` content），同样在下一轮 LLM 调用前切到多模态模型，确保图片不被剥除；
+ - 候选只选**明确声明**支持图片的模型（`input` 含 `image`）；元数据缺失的模型不冒险选择；
++- 图片能力要求贯穿整个故障转移轮次，包括重试验证阶段工具返回图片以及此后的再次切换；
+ - 切换原因记为 `modality`，计入本 session 切换数与累计切换；
+ - 如果没有可用的多模态候选，则通知用户并保持原模型继续（Pi 会照常剥图并附带提示）。
+ 
+@@ -156,17 +157,19 @@ Pi 在把请求发给 Provider 时，会根据当前模型的 `input` 能力静
+ 
+ ## 数据与隐私
+ 
+-健康状态保存在 Pi agent 目录的 `ccswitch-auto-switch-state.json`。其中只有计数、时间、冷却信息、模型系列审查约束和脱敏/截断的错误摘要；插件不会访问凭据、Authorization 请求头、CC Switch 数据库或 Pi 的 `auth.json`。
++健康状态保存在 Pi agent 目录的 `ccswitch-auto-switch-state.json`。其中只有计数、时间、冷却信息和脱敏/截断的错误摘要；模型系列审查约束只保存在 session 内存中；插件不会访问凭据、Authorization 请求头、CC Switch 数据库或 Pi 的 `auth.json`。
+ 
+ ## 开发
+ 
++状态 schema 3 兼容加载 schema 2 的健康记录，将原有累计数保留为共同基线；每个写入实例独立计数，合并时不丢增量、不重复累计。旧版本无法读取 schema 3，新进程中的代码无法修复仍在运行的旧代码。**禁止 schema-2 与 schema-3 版本共用同一目录混跑。**升级时必须依次：① 退出所有使用同一 `PI_CODING_AGENT_DIR` 的旧 Pi 进程并停止相关定时 runner；② 在进程停止后备份 `ccswitch-auto-switch-state.json`；③ 升级使用该目录的所有安装；④ 仅启动升级后的进程。当前版本遇到不支持的 schema，或已观察到 schema 3 后又读到 schema 2 时，会拒绝写入、保留原文件，并在 `ccswitch-auto-switch.log` 记录原因。这不能撤销旧代码已经造成的破坏，因此必须执行上述停机升级步骤。人工启用/禁用按本地单调时间戳选择较新操作；时间戳完全相同时保守保留禁用（旧记录缺字段时也如此）。reset 标记阻止旧快照恢复已清除的记录。计数元数据随实际记录失败或切换的实例数增长。
++
+ ```bash
+ npm install
+ npm run typecheck
+ npm test
+ ```
+ 
+-测试使用 Node 内置测试运行器，覆盖失败分类矩阵、系列级审查避让、Provider 优先选择、输入兼容、冷却、状态持久化以及 Windows 路径。
++TypeScript 已显式列为开发依赖。`npm test` 开启 Node 原生 TypeScript 类型剥离，在 Node 22.19+ 上运行 `health`、`integration`、`logic`、`runner` 全部测试。测试使用 Node 内置测试运行器，覆盖失败分类矩阵、系列级审查避让、Provider 优先选择、输入兼容、冷却、状态持久化以及 Windows 路径。
+ 
+ ## 许可证
+ 
+diff --git a/candidates.ts b/candidates.ts
+index aba7fb5..2e2b58f 100644
+--- a/candidates.ts
++++ b/candidates.ts
+@@ -131,7 +131,9 @@ export function modelFamily(model: Pick<ModelRef, 'id' | 'name'>): string {
+ }
+ 
+ function supportsRequiredInputs(candidate: ModelRef, required: readonly string[] | undefined): boolean {
+-  if (!required?.length || !candidate.input?.length) return true
++  if (!required?.length) return true
++  if (required.includes('image') && !candidate.input?.includes('image')) return false
++  if (!candidate.input?.length) return true
+   return required.every(input => candidate.input!.includes(input))
+ }
+ 
+diff --git a/classify.ts b/classify.ts
+index 297f644..0ef1cf8 100644
+--- a/classify.ts
++++ b/classify.ts
+@@ -10,7 +10,7 @@ export interface Classification {
+ const content = /content[ _-]?(?:filter|policy|blocked|moderation)|sensitive|guardrail|policy[_ -]?violation|responsibleai|safety[_ -]?(?:policy|filter|violation)|security[_ -]?policy|moderation[_ -]?(?:blocked|failed)|blocked by.{0,20}(?:policy|safety|moderation)|data[_ -]?inspection[_ -]?failed|内容(?:审查|审核|安全|违规|被拦截)|安全审核|安全(?:策略|风控).{0,12}(?:阻断|拦截|拒绝)|审核(?:未通过|不通过|失败)|敏感(?:内容|词|信息)?|政治敏感|涉政|不合规|违反.{0,12}(?:安全|政策|规定)/i
+ // 配额/余额类失败（scope provider）。含中文供应商报错：用户积分不足、余额不足、欠费等，
+ // 这些通常不携带英文关键词，漏分类会落入 unknown（仅 2min 模型级冷却），导致死 provider 每轮重试。
+-const quota = /quota|billing|insufficient.?balance|out of budget|usage.?limit|credit.?balance|monthly.?limit|积分不足|余额不足|欠费|请充值|额度.{0,6}(?:用完|耗尽|不足|已用)|无可用额度/i
++const quota = /quota|billing|insufficient.?balance|out of budget|usage.?limit|credit.?balance|balance.{0,12}(?:exhausted|insufficient|depleted)|credits|monthly.?limit|积分不足|余额不足|欠费|请充值|额度.{0,6}(?:用完|耗尽|不足|已用)|无可用额度/i
+ const context = /context.?window|context.?length|too many tokens|prompt is too long|input is too long|token limit/i
+ const transport = /dns|enotfound|eai_again|econn(?:reset|refused|aborted)|epipe|socket|connection|network|fetch failed|tls|certificate|timed? ?out|timeout|stream ended|terminated|websocket|und_err/i
+ const overloaded = /overload|server busy|service unavailable|temporarily unavailable|capacity|upstream|bad gateway/i
+@@ -27,6 +27,7 @@ export function classifyFailure(observation: FailureObservation): Classification
+   if (status === 413) return { kind: 'context_overflow', roundOnly: true }
+   if (status === 429) return { kind: 'rate_limit', scope: 'provider', roundOnly: false, retryAfterMs: observation.retryAfterMs }
+   if (status === 402) return { kind: 'quota', scope: 'provider', roundOnly: false }
++  if (status === 403 && quota.test(text)) return { kind: 'quota', scope: 'provider', roundOnly: false }
+   if (status === 401 || status === 403) return { kind: 'auth', scope: 'provider', roundOnly: false }
+   if (quota.test(text)) return { kind: 'quota', scope: 'provider', roundOnly: false }
+   if (status === 408) return { kind: 'timeout', scope: 'endpoint', roundOnly: false }
+diff --git a/health.ts b/health.ts
+index fda4619..ccd3a99 100644
+--- a/health.ts
++++ b/health.ts
+@@ -15,12 +15,15 @@ const MAX_LOG_BYTES = 512 * 1024
+ export interface HealthRecord {
+   consecutiveFailures: number
+   totalFailures: number
++  /** Per-writer grow-only counters; legacy totals form one shared baseline. */
++  failureCounts?: Record<string, number>
+   lastFailureAt?: number
+   lastSuccessAt?: number
+   cooldownUntil?: number
+   lastClass?: FailureClass
+   lastError?: string
+   disabled?: boolean
++  disabledUpdatedAt?: number
+   leaseUntil?: number
+ }
+ 
+@@ -33,18 +36,22 @@ export interface ContentPolicyConstraint {
+ }
+ 
+ export interface HealthState {
+-  schemaVersion: 2
++  schemaVersion: 2 | 3
+   updatedAt: number
++  /** Reset barriers prevent older snapshots from resurrecting cleared history. */
++  resetAt?: number
++  modelResetAt?: Record<string, number>
+   models: Record<string, HealthRecord>
+   providers: Record<string, HealthRecord>
+   endpoints: Record<string, HealthRecord>
+   /**
+-   * 已从真实失败中学到的模型系列内容审查约束。它不会影响普通故障选模，只在本轮已经
+-   * 发生 content_policy 失败时用于避开同类系列。
++   * Legacy schema-2 field: ignored on load and removed on the next write.
++   * Active policy constraints live only in the owning HealthStore instance.
+    */
+   contentPolicyFamilies?: Record<string, ContentPolicyConstraint>
+   /** 累计成功切换次数（跨 session 持久化，用于衡量扩展有效程度） */
+   switches?: number
++  switchCounts?: Record<string, number>
+   /** 最近成功切换日志（有限条，环形保留） */
+   switchLog?: Array<{
+     at: number
+@@ -87,7 +94,7 @@ function safeEndpoint(value: string): string {
+ }
+ 
+ function blank(): HealthState {
+-  return { schemaVersion: 2, updatedAt: Date.now(), models: {}, providers: {}, endpoints: {}, contentPolicyFamilies: {}, switches: 0, switchLog: [] }
++  return { schemaVersion: 3, updatedAt: Date.now(), models: {}, providers: {}, endpoints: {}, switches: 0, switchLog: [] }
+ }
+ 
+ function redact(text: string | undefined): string | undefined {
+@@ -113,30 +120,29 @@ export class HealthStore {
+   readonly dir: string
+   private state: HealthState = blank()
+   private dirty = false
+-  private replaceOnFlush = false
+-  private resetModels = new Set<string>()
+-  /** 合并磁盘状态后仍需强制清空的审查约束（session 边界） */
+-  private clearContentPolicyOnFlush = false
++  private readonly writer = randomUUID()
++  private manualClock = 0
++  private writeBlocked = false
++  private observedSchema3 = false
++  private constraints: Record<string, ContentPolicyConstraint> = {}
+ 
+   constructor(dir = agentDir()) { this.dir = dir }
+   get file(): string { return join(this.dir, STATE_FILE) }
+   get snapshot(): HealthState { return structuredClone(this.state) }
++  get policyConstraints(): Record<string, ContentPolicyConstraint> { return structuredClone(this.constraints) }
+ 
+   async load(): Promise<void> {
+     await mkdir(this.dir, { recursive: true })
+     try {
+-      if (existsSync(this.file)) {
+-        const parsed = JSON.parse(await readFile(this.file, 'utf8')) as HealthState
+-        if (parsed.schemaVersion !== 2 || !parsed.models || !parsed.providers || !parsed.endpoints) throw new Error('unsupported state schema')
+-        this.state = parsed
+-      } else {
+-        await this.migrateLegacy()
+-      }
+-    } catch {
+-      if (existsSync(this.file)) await rename(this.file, `${this.file}.corrupt-${Date.now()}`).catch(() => {})
+-      this.state = blank()
+-      this.dirty = true
+-      await this.flush()
++      this.state = await this.readDisk()
++      this.writeBlocked = false
++      delete this.state.contentPolicyFamilies
++      if (!existsSync(this.file)) await this.migrateLegacy()
++    } catch (error) {
++      // Unknown/newer formats are not corruption. Keep the original in place
++      // and fail closed until an explicit successful reload repairs the state.
++      this.writeBlocked = true
++      await this.log(`health state load refused: ${String(error)}`)
+     }
+   }
+ 
+@@ -163,6 +169,7 @@ export class HealthStore {
+     const failures = previous.consecutiveFailures + 1
+     bucket[key] = {
+       ...previous, consecutiveFailures: failures, totalFailures: previous.totalFailures + 1,
++      failureCounts: incrementCounts(previous.failureCounts, previous.totalFailures, this.writer),
+       lastFailureAt: Date.now(), cooldownUntil: Date.now() + cooldownMs(kind, failures, retryAfterMs),
+       lastClass: kind, lastError: redact(message), leaseUntil: undefined,
+     }
+@@ -175,7 +182,7 @@ export class HealthStore {
+    * 本 session 内再次观察到同系列审查会增加证据计数并刷新时间戳。
+    */
+   recordContentPolicyConstraint(family: string, model: ModelRef, message?: string): void {
+-    const constraints = this.state.contentPolicyFamilies ??= {}
++    const constraints = this.constraints
+     const previous = constraints[family]
+     const now = Date.now()
+     constraints[family] = {
+@@ -185,7 +192,6 @@ export class HealthStore {
+       lastModel: modelKey(model),
+       lastError: redact(message),
+     }
+-    this.touch()
+   }
+ 
+   recordSuccess(model: ModelRef): void {
+@@ -200,6 +206,7 @@ export class HealthStore {
+    * 用于衡量扩展有效程度，并在 /ccswitch status 面板展示。
+    */
+   recordSwitch(from: string, to: string, reason?: string): void {
++    this.state.switchCounts = incrementCounts(this.state.switchCounts, this.state.switches ?? 0, this.writer)
+     this.state.switches = (this.state.switches ?? 0) + 1
+     const log = this.state.switchLog ?? []
+     log.push({ at: Date.now(), from, to, reason })
+@@ -215,35 +222,53 @@ export class HealthStore {
+ 
+   disable(key: string, disabled: boolean): void {
+     const old = this.state.models[key] ?? { consecutiveFailures: 0, totalFailures: 0 }
+-    this.state.models[key] = { ...old, disabled }
++    this.state.models[key] = { ...old, disabled, disabledUpdatedAt: this.manualVersion() }
+     this.touch()
+   }
+ 
+-  reactivate(model: ModelRef): void {
+-    const key = modelKey(model)
+-    for (const [scope, id] of [['model', key], ['provider', model.provider], ['endpoint', endpointKey(model)]] as const) {
+-      const old = this.bucket(scope)[id]
+-      if (old) this.bucket(scope)[id] = { ...old, disabled: false, cooldownUntil: undefined, leaseUntil: undefined, lastSuccessAt: Date.now(), consecutiveFailures: 0 }
+-    }
+-    this.touch()
++  async reactivate(model: ModelRef): Promise<boolean> {
++    return this.reactivateAtomically(model)
+   }
+ 
+-  reactivateAll(): void {
+-    const now = Date.now()
+-    for (const bucket of [this.state.models, this.state.providers, this.state.endpoints]) {
+-      for (const [key, old] of Object.entries(bucket)) bucket[key] = { ...old, disabled: false, cooldownUntil: undefined, leaseUntil: undefined, lastSuccessAt: now, consecutiveFailures: 0 }
++  async reactivateAll(): Promise<boolean> {
++    return this.reactivateAtomically()
++  }
++
++  private async reactivateAtomically(model?: ModelRef): Promise<boolean> {
++    try {
++      if (this.writeBlocked) throw new Error('health state writes are blocked; reload a supported state first')
++      return await this.withLock(async () => {
++        this.state = mergeState(await this.readDisk(), this.state)
++        const disabledUpdatedAt = this.manualVersion()
++        const targets: Array<[HealthScope, string]> = model
++          ? [['model', modelKey(model)], ['provider', model.provider], ['endpoint', endpointKey(model)]]
++          : (['model', 'provider', 'endpoint'] as const).flatMap(scope => Object.keys(this.bucket(scope)).map(key => [scope, key] as [HealthScope, string]))
++        for (const [scope, key] of targets) {
++          const old = this.bucket(scope)[key]
++          if (!old) continue
++          this.bucket(scope)[key] = { ...old, disabled: false, disabledUpdatedAt,
++            cooldownUntil: undefined, leaseUntil: undefined, consecutiveFailures: 0,
++            lastSuccessAt: Math.max(Date.now(), (old.lastFailureAt ?? 0) + 1) }
++        }
++        this.touch()
++        await this.commit()
++        return true
++      })
++    } catch (error) {
++      await this.log(`reactivation refused: ${String(error)}`)
++      return false
+     }
+-    this.touch()
+   }
+ 
+   reset(target: string | 'all'): void {
++    const resetAt = this.manualVersion()
+     if (target === 'all') {
+-      this.state = blank()
+-      this.replaceOnFlush = true
+-      this.resetModels.clear()
++      this.clearContentPolicyConstraints()
++      this.state = { ...blank(), resetAt }
+     } else {
+       delete this.state.models[target]
+-      this.resetModels.add(target)
++      const resets = this.state.modelResetAt ??= {}
++      resets[target] = resetAt
+     }
+     this.touch()
+   }
+@@ -253,40 +278,44 @@ export class HealthStore {
+    * 对审查内容敏感，因此不在 session 间继承审查约束。
+    */
+   clearContentPolicyConstraints(): void {
+-    this.state.contentPolicyFamilies = {}
+-    this.clearContentPolicyOnFlush = true
+-    this.touch()
++    this.constraints = {}
+   }
+ 
+   isBlocked(model: ModelRef, now = Date.now()): boolean {
++    if (this.writeBlocked) return true
+     return [this.state.models[modelKey(model)], this.state.providers[model.provider], this.state.endpoints[endpointKey(model)]]
+       .some(record => Boolean(record?.disabled || (record?.cooldownUntil && record.cooldownUntil > now) || (record?.leaseUntil && record.leaseUntil > now)))
+   }
+ 
+-  async claimProvider(model: ModelRef): Promise<boolean> {
+-    const key = model.provider
+-    let claimed = true
++  async claimCandidate(model: ModelRef): Promise<boolean> {
++    if (this.writeBlocked) return false
++    let claimed = false
+     await this.withLock(async () => {
+-      if (!this.replaceOnFlush) this.state = mergeState(await this.readDisk(), this.state)
+-      const record = this.state.providers[key]
+-      if (!record || !(record.cooldownUntil && record.cooldownUntil <= Date.now())) return
+-      if (record.leaseUntil && record.leaseUntil > Date.now()) { claimed = false; return }
+-      record.leaseUntil = Date.now() + 2 * 60_000
+-      this.touch()
+-      await this.commit()
+-    }).catch(() => { claimed = false })
++      const disk = await this.readDisk()
++      this.state = mergeState(disk, this.state)
++      const records = (state: HealthState) => [state.models[modelKey(model)], state.providers[model.provider], state.endpoints[endpointKey(model)]]
++      const now = Date.now()
++      // Check disk as well: a stale local disabled flag must never override a
++      // disable written by another process before this atomic claim.
++      if ([...records(disk), ...records(this.state)].some(record => record?.disabled || (record?.cooldownUntil ?? 0) > now || (record?.leaseUntil ?? 0) > now)) return
++      const expired = records(this.state).filter(record => record?.cooldownUntil !== undefined && record.cooldownUntil <= now)
++      if (expired.length) {
++        for (const record of expired) record!.leaseUntil = now + 2 * 60_000
++        this.touch()
++        await this.commit()
++      }
++      claimed = true
++    }).catch(async error => { claimed = false; await this.log(`candidate claim refused: ${String(error)}`) })
+     return claimed
+   }
+ 
+   async flush(): Promise<void> {
+-    if (!this.dirty) return
++    if (!this.dirty || this.writeBlocked) return
+     await this.withLock(async () => {
+-      if (!this.replaceOnFlush) this.state = mergeState(await this.readDisk(), this.state)
+-      for (const key of this.resetModels) delete this.state.models[key]
+-      // 必须在 merge 之后再清空：磁盘上残留的旧 session 约束不能因合并而重新出现
+-      if (this.clearContentPolicyOnFlush) this.state.contentPolicyFamilies = {}
++      // Even reset-all must validate the on-disk schema before writing.
++      this.state = mergeState(await this.readDisk(), this.state)
+       await this.commit()
+-    }).catch(() => {})
++    }).catch(async error => { await this.log(`health state flush refused: ${String(error)}`) })
+   }
+ 
+   async log(line: string): Promise<void> {
+@@ -310,20 +339,39 @@ export class HealthStore {
+   private touch(): void { this.dirty = true }
+   private async readDisk(): Promise<HealthState> {
+     try {
+-      if (!existsSync(this.file)) return blank()
+-      const parsed = JSON.parse(await readFile(this.file, 'utf8')) as HealthState
+-      return parsed.schemaVersion === 2 ? parsed : blank()
+-    } catch { return blank() }
++      let raw: string
++      try { raw = await readFile(this.file, 'utf8') }
++      catch (error: any) { if (error?.code === 'ENOENT') return blank(); throw error }
++      const parsed = JSON.parse(raw) as HealthState
++      if (!parsed || (parsed.schemaVersion !== 2 && parsed.schemaVersion !== 3)) throw new Error(`unsupported state schema: ${parsed?.schemaVersion}`)
++      if (this.observedSchema3 && parsed.schemaVersion === 2) throw new Error('unsupported state schema downgrade: 3 -> 2; stop all old Pi processes')
++      if (!parsed.models || !parsed.providers || !parsed.endpoints) throw new Error('invalid health state buckets')
++      this.observedSchema3 ||= parsed.schemaVersion === 3
++      return parsed
++    } catch (error) {
++      this.writeBlocked = true
++      throw error
++    }
++  }
++
++  private manualVersion(): number {
++    const records = [...Object.values(this.state.models), ...Object.values(this.state.providers), ...Object.values(this.state.endpoints)]
++    this.manualClock = Math.max(Date.now(), this.manualClock + 1, (this.state.resetAt ?? 0) + 1,
++      ...Object.values(this.state.modelResetAt ?? {}).map(at => at + 1),
++      ...records.map(record => (record.disabledUpdatedAt ?? 0) + 1))
++    return this.manualClock
+   }
++
+   private async commit(): Promise<void> {
++    if (this.writeBlocked) throw new Error("health state writes are blocked; reload a supported state first")
++    this.state.schemaVersion = 3
++    delete this.state.contentPolicyFamilies
+     this.state.updatedAt = Date.now()
+     const temp = `${this.file}.tmp-${process.pid}-${randomUUID()}`
+     await writeFile(temp, JSON.stringify(this.state, null, 2), 'utf8')
+     await rename(temp, this.file)
++    this.observedSchema3 = true
+     this.dirty = false
+-    this.replaceOnFlush = false
+-    this.resetModels.clear()
+-    this.clearContentPolicyOnFlush = false
+   }
+   private bucket(scope: HealthScope): Record<string, HealthRecord> {
+     return scope === 'model' ? this.state.models : scope === 'provider' ? this.state.providers : this.state.endpoints
+@@ -351,10 +399,15 @@ function mergeRecord(a: HealthRecord | undefined, b: HealthRecord | undefined):
+   const lastFailureAt = Math.max(a.lastFailureAt ?? 0, b.lastFailureAt ?? 0)
+   const lastSuccessAt = Math.max(a.lastSuccessAt ?? 0, b.lastSuccessAt ?? 0)
+   const successWins = lastSuccessAt > lastFailureAt
++  const failureCounts = mergeCounts(a.failureCounts, a.totalFailures, b.failureCounts, b.totalFailures)
+   return {
+     ...newest,
+-    totalFailures: Math.max(a.totalFailures, b.totalFailures),
+-    disabled: b.disabled ?? a.disabled,
++    totalFailures: sumCounts(failureCounts),
++    failureCounts,
++    disabled: (a.disabledUpdatedAt ?? 0) === (b.disabledUpdatedAt ?? 0)
++      ? (a.disabled === true || b.disabled === true ? true : b.disabled ?? a.disabled)
++      : (a.disabledUpdatedAt ?? 0) > (b.disabledUpdatedAt ?? 0) ? a.disabled : b.disabled,
++    disabledUpdatedAt: Math.max(a.disabledUpdatedAt ?? 0, b.disabledUpdatedAt ?? 0) || undefined,
+     lastFailureAt: lastFailureAt || undefined,
+     lastSuccessAt: lastSuccessAt || undefined,
+     consecutiveFailures: successWins ? 0 : Math.max(a.consecutiveFailures, b.consecutiveFailures),
+@@ -373,26 +426,59 @@ function mergeBucket(a: Record<string, HealthRecord>, b: Record<string, HealthRe
+ }
+ 
+ function mergeState(a: HealthState, b: HealthState): HealthState {
+-  const switches = Math.max(a.switches ?? 0, b.switches ?? 0)
++  const resetAt = Math.max(a.resetAt ?? 0, b.resetAt ?? 0)
++  a = afterGlobalReset(a, resetAt)
++  b = afterGlobalReset(b, resetAt)
++  const modelResetAt = { ...a.modelResetAt }
++  for (const [key, at] of Object.entries(b.modelResetAt ?? {})) modelResetAt[key] = Math.max(modelResetAt[key] ?? 0, at)
++  const models = mergeBucket(a.models, b.models)
++  for (const [key, at] of Object.entries(modelResetAt)) {
++    const record = mergeRecord(afterReset(a.models[key], a.modelResetAt?.[key] ?? 0, at), afterReset(b.models[key], b.modelResetAt?.[key] ?? 0, at))
++    if (record) models[key] = record
++    else delete models[key]
++  }
++  const switchCounts = mergeCounts(a.switchCounts, a.switches ?? 0, b.switchCounts, b.switches ?? 0)
++  const switches = sumCounts(switchCounts)
+   // 取最近更新的 switchLog（按 at 去倒序合并，保留最新 20 条）
+   const log = [...(a.switchLog ?? []), ...(b.switchLog ?? [])]
+     .sort((x, y) => y.at - x.at)
+     .filter((entry, index, all) => index === 0 || all[index - 1].at !== entry.at || all[index - 1].from !== entry.from || all[index - 1].to !== entry.to)
+     .slice(0, 20)
+-  const contentPolicyFamilies: Record<string, ContentPolicyConstraint> = {}
+-  for (const family of new Set([...Object.keys(a.contentPolicyFamilies ?? {}), ...Object.keys(b.contentPolicyFamilies ?? {})])) {
+-    const left = a.contentPolicyFamilies?.[family]
+-    const right = b.contentPolicyFamilies?.[family]
+-    if (!left) contentPolicyFamilies[family] = right!
+-    else if (!right) contentPolicyFamilies[family] = left
+-    else {
+-      const newest = right.lastObservedAt >= left.lastObservedAt ? right : left
+-      contentPolicyFamilies[family] = {
+-        ...newest,
+-        observations: Math.max(left.observations, right.observations),
+-        avoidUntil: Math.max(left.avoidUntil, right.avoidUntil),
+-      }
++  return { schemaVersion: 3, resetAt: resetAt || undefined, modelResetAt, updatedAt: Math.max(a.updatedAt ?? 0, b.updatedAt ?? 0), models, providers: mergeBucket(a.providers ?? {}, b.providers ?? {}), endpoints: mergeBucket(a.endpoints ?? {}, b.endpoints ?? {}), switchCounts, switches, switchLog: log }
++}
++
++// Each store increments only its own component. Merging the same state twice is
++// idempotent; independent increments add without inflating the backoff streak.
++function mergeCounts(a: Record<string, number> | undefined, aTotal: number, b: Record<string, number> | undefined, bTotal: number): Record<string, number> {
++  const left = a ?? { legacy: aTotal }, right = b ?? { legacy: bTotal }
++  const result = { ...left }
++  for (const [writer, count] of Object.entries(right)) result[writer] = Math.max(result[writer] ?? 0, count)
++  return result
++}
++function incrementCounts(counts: Record<string, number> | undefined, total: number, writer: string): Record<string, number> {
++  const next = { ...(counts ?? { legacy: total }) }
++  next[writer] = (next[writer] ?? 0) + 1
++  return next
++}
++function sumCounts(counts: Record<string, number>): number {
++  return Object.values(counts).reduce((sum, count) => sum + count, 0)
++}
++
++function afterReset(record: HealthRecord | undefined, sourceResetAt: number, resetAt: number): HealthRecord | undefined {
++  if (sourceResetAt >= resetAt || !record) return record
++  // A manual operation newer than the reset survives, but old health history
++  // does not. Legacy records have timestamp zero and cannot beat a reset.
++  if ((record.disabledUpdatedAt ?? 0) > resetAt) return { consecutiveFailures: 0, totalFailures: 0, disabled: record.disabled, disabledUpdatedAt: record.disabledUpdatedAt }
++  return undefined
++}
++function afterGlobalReset(state: HealthState, resetAt: number): HealthState {
++  if ((state.resetAt ?? 0) >= resetAt) return state
++  const clean = { ...blank(), resetAt }
++  for (const scope of ['models', 'providers', 'endpoints'] as const) {
++    for (const [key, record] of Object.entries(state[scope])) {
++      const kept = afterReset(record, state.resetAt ?? 0, resetAt)
++      if (kept) clean[scope][key] = kept
+     }
+   }
+-  return { schemaVersion: 2, updatedAt: Math.max(a.updatedAt ?? 0, b.updatedAt ?? 0), models: mergeBucket(a.models ?? {}, b.models ?? {}), providers: mergeBucket(a.providers ?? {}, b.providers ?? {}), endpoints: mergeBucket(a.endpoints ?? {}, b.endpoints ?? {}), contentPolicyFamilies, switches, switchLog: log }
++  return clean
+ }
+diff --git a/index.ts b/index.ts
+index 15837be..dadeb13 100644
+--- a/index.ts
++++ b/index.ts
+@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
+ import type { ExtensionAPI, ExtensionContext, FailureObservation, ModelRef } from './types.ts'
+ import { classifyFailure, parseRetryAfter } from './classify.ts'
+ import { candidateSnapshot, effectiveCandidates, chooseCandidate, multimodalCandidates, modelFamily, summarizeCandidateHealth } from './candidates.ts'
+-import { HealthStore, endpointKey, modelKey, platformKey, type HealthState } from './health.ts'
++import { HealthStore, endpointKey, modelKey, platformKey, type ContentPolicyConstraint } from './health.ts'
+ 
+ const FIRST_RESPONSE_TIMEOUT = 90_000
+ const STREAM_IDLE_TIMEOUT = 120_000
+@@ -33,6 +33,8 @@ interface Round {
+   startedAt: number
+   text: string
+   images?: Array<Record<string, unknown>>
++  needsImage: boolean
++  modalitySwitch?: Promise<void>
+   tried: Set<string>
+   attempts: number
+   hadTool: boolean
+@@ -43,7 +45,7 @@ interface Round {
+   observation?: FailureObservation
+   model?: ModelRef
+   endpointFails?: EndpointFailTracker
+-  /** 本轮内容审查故障转移中必须避开的模型系列（包含持久化学到的约束）。 */
++  /** 本轮内容审查故障转移中必须避开的模型系列（包含本 session 学到的约束）。 */
+   avoidFamilies?: Set<string>
+   /** 本轮内最后一次成功切换的时间；用于刷新 ROUND_LIMIT 窗口，避免供应商内部重试耗时导致误判“超过本轮时间限制” */
+   lastSwitchAt?: number
+@@ -53,8 +55,8 @@ interface Round {
+ 
+ function key(model: ModelRef | undefined): string | undefined { return model && modelKey(model) }
+ function canRetry(ctx: ExtensionContext): boolean { return ctx.mode === 'tui' || ctx.mode === 'rpc' }
+-function activePolicyFamilies(state: HealthState, now = Date.now()): Set<string> {
+-  return new Set(Object.entries(state.contentPolicyFamilies ?? {})
++function activePolicyFamilies(constraints: Record<string, ContentPolicyConstraint>, now = Date.now()): Set<string> {
++  return new Set(Object.entries(constraints)
+     .filter(([, record]) => record.avoidUntil > now)
+     .map(([family]) => family))
+ }
+@@ -154,7 +156,7 @@ export default function (pi: ExtensionAPI) {
+     const candidates = snapshot.models
+     const counts = summarizeCandidateHealth(candidates, state)
+     const now = Date.now()
+-    const policyFamilies = activePolicyFamilies(state, now)
++    const policyFamilies = activePolicyFamilies(health.policyConstraints, now)
+     const rows = candidates.slice(0, 10).map(model => {
+       const modelRecord = state.models[modelKey(model)]
+       const records = [modelRecord, state.providers[model.provider], state.endpoints[endpointKey(model)]]
+@@ -179,7 +181,11 @@ export default function (pi: ExtensionAPI) {
+     const policySummary = policyFamilies.size ? [...policyFamilies].join(', ') : '无'
+     const action = await ctx.ui.select(`CCSwitch 健康面板\n当前：${key(ctx.model) ?? '无'}\n${scopeLabel} · 唯一模型：${counts.total} · 健康：${counts.healthy} · 自动冷却：${counts.cooling} · 手动禁用：${counts.disabled}\n熔断记录：${counts.breakerRecords} · 审查约束系列：${policySummary}\n${switchSummary}${switchPanel}\n${rows.join('\n') || '没有可用模型'}`, ['刷新', '重新激活当前模型', '禁用当前模型', '重置当前模型历史', '关闭'])
+     if (action === '刷新') await refresh(ctx)
+-    if (action === '重新激活当前模型' && ctx.model) { health.reactivate(ctx.model); await health.flush(); status(ctx); notify(ctx, '已重新激活当前模型') }
++    if (action === '重新激活当前模型' && ctx.model) {
++      const restored = await health.reactivate(ctx.model)
++      status(ctx)
++      notify(ctx, restored ? '已重新激活当前模型' : '重新激活失败，健康状态未确认保存；请查看 ccswitch-auto-switch.log', restored ? 'info' : 'error')
++    }
+     if (action === '禁用当前模型' && ctx.model) { health.disable(modelKey(ctx.model), true); await health.flush(); status(ctx); notify(ctx, '已禁用当前模型', 'warning') }
+     if (action === '重置当前模型历史' && ctx.model) {
+       const ok = !ctx.ui.confirm || await ctx.ui.confirm('重置健康历史', `删除 ${modelKey(ctx.model)} 的记录？`)
+@@ -223,12 +229,16 @@ export default function (pi: ExtensionAPI) {
+    * 模态预检主动切换：当前模型不支持图片但本轮输入/工具结果带图时，
+    * 主动切到一个健康的多模态候选（不等失败）。无候选时通知并保持原模型。
+    */
+-  const proactiveModalitySwitch = async (ctx: ExtensionContext, round: Round): Promise<void> => {
++  const performModalitySwitch = async (ctx: ExtensionContext, round: Round): Promise<void> => {
+     const current = round.model ?? ctx.model
+-    if (!current || !canRetry(ctx) || round.phase !== 'monitoring') return
++    if (!current || !canRetry(ctx) || !['monitoring', 'verifying'].includes(round.phase)) return
+     if (current.input?.includes('image')) return
+     const candidates = effectiveCandidates(ctx.scopedModels, ctx.modelRegistry.getAvailable())
+-    const next = multimodalCandidates(candidates, current, health.snapshot)[0]
++    let next: ModelRef | undefined
++    for (const candidate of multimodalCandidates(candidates, current, health.snapshot)) {
++      if (round.tried.has(modelKey(candidate)) || round.avoidFamilies?.has(modelFamily(candidate)) || round.endpointFails?.isolated.has(platformKey(candidate))) continue
++      if (await health.claimCandidate(candidate)) { next = candidate; break }
++    }
+     if (!next) {
+       await health.log(`modality precheck: no multimodal candidate, staying on ${modelKey(current)}`)
+       notify(ctx, 'CCSwitch：当前模型不支持图片，且没有可用的多模态候选模型，已保持原模型', 'warning')
+@@ -263,6 +273,14 @@ export default function (pi: ExtensionAPI) {
+     status(ctx)
+   }
+ 
++  const proactiveModalitySwitch = (ctx: ExtensionContext, target: Round): Promise<void> => {
++    // Concurrent tool completions await the same switch before returning to Pi.
++    if (!target.modalitySwitch) {
++      target.modalitySwitch = performModalitySwitch(ctx, target).finally(() => { target.modalitySwitch = undefined })
++    }
++    return target.modalitySwitch
++  }
++
+   const failover = async (ctx: ExtensionContext) => {
+     if (!round || !round.observation || !round.model || !canRetry(ctx)) return
+     const classification = classifyFailure(round.observation)
+@@ -285,7 +303,7 @@ export default function (pi: ExtensionAPI) {
+     if (classification.kind === 'content_policy') {
+       health.recordContentPolicyConstraint(modelFamily(round.model), round.model, round.observation.message)
+       round.avoidFamilies ??= new Set()
+-      for (const family of activePolicyFamilies(health.snapshot)) round.avoidFamilies.add(family)
++      for (const family of activePolicyFamilies(health.policyConstraints)) round.avoidFamilies.add(family)
+     }
+     // 失败必须先落台账再做时限判断：否则本轮最后一次失败不会进健康状态（无冷却），
+     // 下一轮还会重试同一个刚失败的模型/provider
+@@ -303,11 +321,11 @@ export default function (pi: ExtensionAPI) {
+       health: health.snapshot,
+       avoidEndpoints: failTracker.isolated,
+       avoidFamilies: round!.avoidFamilies,
+-      requiredInputs: round!.images?.length ? ['text', 'image'] : ['text'],
++      requiredInputs: round!.needsImage ? ['text', 'image'] : ['text'],
+     })
+     let next = chooseCandidate(candidates, candidateOptions())
+     while (next) {
+-      if (!await health.claimProvider(next)) { round.tried.add(modelKey(next)); next = chooseCandidate(candidates, candidateOptions()); continue }
++      if (!await health.claimCandidate(next)) { round.tried.add(modelKey(next)); next = chooseCandidate(candidates, candidateOptions()); continue }
+       round.attempts++
+       ctx.ui.setWorkingMessage(`模型异常，正在切换到 ${modelKey(next)}…`)
+       const previousModel = round.model
+@@ -371,14 +389,20 @@ export default function (pi: ExtensionAPI) {
+     if (event.source === 'extension') return { action: 'continue' }
+     clearWatchdog()
+     lastStatus = {}
+-    round = { id: (round?.id ?? 0) + 1, phase: 'monitoring', startedAt: Date.now(), text: event.text, images: event.images, tried: new Set(), attempts: 0, hadTool: false, inTool: false, hadOutput: false, watchdog: false, cleanRetry: false, model: ctx.model, endpointFails: undefined, avoidFamilies: undefined, errors: new Map() }
++    round = { id: (round?.id ?? 0) + 1, phase: 'monitoring', startedAt: Date.now(), text: event.text, images: event.images, needsImage: Boolean(event.images?.length), tried: new Set(), attempts: 0, hadTool: false, inTool: false, hadOutput: false, watchdog: false, cleanRetry: false, model: ctx.model, endpointFails: undefined, avoidFamilies: undefined, errors: new Map() }
+     status(ctx)
+     // 模态预检：输入带图片但当前模型不支持图片（非多模态）→ 主动切换到多模态模型，
+     // 避免 Pi 静默剥图后模型只回答“看不到图片”（此类情况不会触发 failover）。
+     if (event.images?.length && round.phase === 'monitoring') await proactiveModalitySwitch(ctx, round)
+     return { action: 'continue' }
+   })
+-  pi.on('before_provider_request', (_event, ctx) => { lastStatus = {}; if (round) { round.inTool = false; armWatchdog(ctx, FIRST_RESPONSE_TIMEOUT, round.id) } })
++  pi.on('before_provider_request', (_event, ctx) => {
++    lastStatus = {}
++    if (round) {
++      round.inTool = false
++      armWatchdog(ctx, FIRST_RESPONSE_TIMEOUT, round.id)
++    }
++  })
+   pi.on('after_provider_response', (event, ctx) => {
+     lastStatus = { status: event.status, retryAfterMs: parseRetryAfter(event.headers?.['retry-after']) }
+     if (round && event.status >= 200 && event.status < 300) armWatchdog(ctx, STREAM_IDLE_TIMEOUT, round.id)
+@@ -401,7 +425,10 @@ export default function (pi: ExtensionAPI) {
+     round.inTool = false
+     // 工具结果含图片（如 read 图片文件）且当前模型不支持 → 主动切换多模态模型，
+     // 确保下一轮 LLM 调用使用新模型，工具结果中的图片不被 Pi 静默剥除。
+-    if (round.phase === 'monitoring' && resultContainsImage(_event.result)) await proactiveModalitySwitch(ctx, round)
++    if (resultContainsImage(_event.result)) {
++      round.needsImage = true
++      await proactiveModalitySwitch(ctx, round)
++    }
+   })
+   pi.on('turn_end', async (event, ctx) => {
+     const message = event.message
+@@ -483,9 +510,11 @@ export default function (pi: ExtensionAPI) {
+     if (!target && verb !== 'reset') { notify(ctx, '请指定 provider/model 或 all', 'warning'); return }
+     if (verb === 'disable' && target) { health.disable(target, true); await health.flush(); status(ctx); return }
+     if (verb === 'reactivate' && target) {
+-      if (target === 'all') health.reactivateAll()
+-      else { const [provider, ...rest] = target.split('/'); health.reactivate({ provider, id: rest.join('/') }) }
+-      await health.flush(); status(ctx); return
++      const [provider, ...rest] = target.split('/')
++      const restored = await (target === 'all' ? health.reactivateAll() : health.reactivate({ provider, id: rest.join('/') }))
++      status(ctx)
++      notify(ctx, restored ? '已重新激活' : '重新激活失败，健康状态未确认保存；请查看 ccswitch-auto-switch.log', restored ? 'info' : 'error')
++      return
+     }
+     if (verb === 'reset' && target) {
+       const ok = !ctx.ui.confirm || await ctx.ui.confirm('重置健康历史', `删除 ${target} 的健康记录？`)
+@@ -499,7 +528,7 @@ export default function (pi: ExtensionAPI) {
+     const snapshot = candidateSnapshot(ctx.scopedModels, ctx.modelRegistry.getAvailable())
+     const counts = summarizeCandidateHealth(snapshot.models, health.snapshot)
+     const state = health.snapshot
+-    const policyFamilies = activePolicyFamilies(state)
++    const policyFamilies = activePolicyFamilies(health.policyConstraints)
+     const source = snapshot.source === 'scoped' ? `Pi scope ${snapshot.sourceEntries} 条` : `Pi 注册表 ${snapshot.sourceEntries} 条`
+     notify(ctx, `CCSwitch 自检：${source} · 唯一模型 ${counts.total} · 健康 ${counts.healthy} · 自动冷却 ${counts.cooling} · 手动禁用 ${counts.disabled} · 熔断记录 ${counts.breakerRecords} · 审查约束系列 ${policyFamilies.size} · 本session切换 ${sessionSwitches} · 累计切换 ${state.switches ?? 0}`, counts.total ? 'info' : 'warning')
+   }})
+diff --git a/package-lock.json b/package-lock.json
+index ede9604..6468f69 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1,18 +1,19 @@
+ {
+   "name": "pi-ccswitch-auto-switch",
+-  "version": "0.3.7",
++  "version": "0.3.11",
+   "lockfileVersion": 3,
+   "requires": true,
+   "packages": {
+     "": {
+       "name": "pi-ccswitch-auto-switch",
+-      "version": "0.3.7",
++      "version": "0.3.11",
+       "license": "MIT",
+       "bin": {
+         "pi-ccswitch-run": "runner.mjs"
+       },
+       "devDependencies": {
+-        "@types/node": "^22.19.19"
++        "@types/node": "^22.19.19",
++        "typescript": "~5.9.3"
+       },
+       "engines": {
+         "node": ">=22.19.0"
+@@ -28,6 +29,20 @@
+         "undici-types": "~6.21.0"
+       }
+     },
++    "node_modules/typescript": {
++      "version": "5.9.3",
++      "resolved": "https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz",
++      "integrity": "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==",
++      "dev": true,
++      "license": "Apache-2.0",
++      "bin": {
++        "tsc": "bin/tsc",
++        "tsserver": "bin/tsserver"
++      },
++      "engines": {
++        "node": ">=14.17"
++      }
++    },
+     "node_modules/undici-types": {
+       "version": "6.21.0",
+       "resolved": "https://registry.npmjs.org/undici-types/-/undici-types-6.21.0.tgz",
+diff --git a/package.json b/package.json
+index 3d5ad0b..b8de701 100644
+--- a/package.json
++++ b/package.json
+@@ -39,10 +39,11 @@
+     "node": ">=22.19.0"
+   },
+   "scripts": {
+-    "test": "node --test test/*.test.ts test/*.test.mjs",
++    "test": "node --experimental-strip-types --test test/*.test.ts test/*.test.mjs",
+     "typecheck": "tsc --noEmit --allowImportingTsExtensions --module nodenext --moduleResolution nodenext --target es2022 --skipLibCheck *.ts"
+   },
+   "devDependencies": {
+-    "@types/node": "^22.19.19"
++    "@types/node": "^22.19.19",
++    "typescript": "~5.9.3"
+   }
+ }
+diff --git a/test/health.test.ts b/test/health.test.ts
+index f65a6af..38acc1b 100644
+--- a/test/health.test.ts
++++ b/test/health.test.ts
+@@ -1,9 +1,9 @@
+ import test from 'node:test'
+ import assert from 'node:assert/strict'
+-import { mkdtemp, rm } from 'node:fs/promises'
++import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises'
+ import { tmpdir } from 'node:os'
+ import { join } from 'node:path'
+-import { HealthStore, agentDir } from '../health.ts'
++import { HealthStore, agentDir, endpointKey, modelKey } from '../health.ts'
+ import type { ModelRef } from '../types.ts'
+ 
+ const model: ModelRef = { provider: 'provider-a', id: 'model-a', baseUrl: 'https://example.test/v1?token=never-store' }
+@@ -22,7 +22,7 @@ test('persists a provider breaker and restores it from disk', async () => {
+     assert.equal(second.isBlocked(model), true)
+     assert.doesNotMatch(second.snapshot.providers[model.provider].lastError ?? '', /sk-this-must-not-be-saved/)
+ 
+-    second.reactivate(model)
++    await second.reactivate(model)
+     await second.flush()
+     assert.equal(second.isBlocked(model), false)
+   } finally {
+@@ -61,7 +61,7 @@ test('recordSwitch persists cumulative count and a capped switch log', async ()
+   }
+ })
+ 
+-test('persists learned content-policy family constraints and reset all really clears them', async () => {
++test('content-policy constraints stay in the owning instance and reset clears them', async () => {
+   const dir = await mkdtemp(join(tmpdir(), 'ccswitch-policy-family-'))
+   const glm: ModelRef = { provider: 'zhipu', id: 'glm-4.5' }
+   try {
+@@ -72,17 +72,20 @@ test('persists learned content-policy family constraints and reset all really cl
+ 
+     const reloaded = new HealthStore(dir)
+     await reloaded.load()
+-    const constraint = reloaded.snapshot.contentPolicyFamilies?.glm
++    assert.deepEqual(reloaded.policyConstraints, {})
++    const constraint = first.policyConstraints.glm
+     assert.equal(constraint?.observations, 1)
+     assert.equal(constraint?.lastModel, 'zhipu/glm-4.5')
+     assert.ok((constraint?.avoidUntil ?? 0) > Date.now())
+     assert.doesNotMatch(constraint?.lastError ?? '', /sk-this-must-not-be-saved/)
+ 
++    first.reset('all')
++    assert.deepEqual(first.policyConstraints, {})
+     reloaded.reset('all')
+     await reloaded.flush()
+     const reset = new HealthStore(dir)
+     await reset.load()
+-    assert.deepEqual(reset.snapshot.contentPolicyFamilies, {})
++    assert.equal(reset.snapshot.contentPolicyFamilies, undefined)
+   } finally {
+     await rm(dir, { recursive: true, force: true })
+   }
+@@ -102,16 +105,229 @@ test('clearContentPolicyConstraints removes learned families while keeping other
+     // 新 session：load 到旧约束 → clear → flush（真实 session 边界场景）
+     const store = new HealthStore(dir)
+     await store.load()
+-    assert.ok(store.snapshot.contentPolicyFamilies?.glm, 'new session should see the previously persisted constraint before clearing')
++    assert.deepEqual(store.policyConstraints, {})
+     store.clearContentPolicyConstraints()
+     await store.flush()
+ 
+     // 再次从磁盘读，确认约束确实被清掉，而不是被 merge 逻辑重新带回来
+     const reloaded = new HealthStore(dir)
+     await reloaded.load()
+-    assert.deepEqual(reloaded.snapshot.contentPolicyFamilies, {}, 'learned content policy families must not survive session restart')
++    assert.equal(reloaded.snapshot.contentPolicyFamilies, undefined)
++    assert.ok(previous.policyConstraints.glm, 'another instance must not clear the owning session')
++    previous.recordFailure('provider', glm.provider, 'quota')
++    await previous.flush()
++    store.recordSwitch('a', 'b')
++    await store.flush()
++    assert.deepEqual(store.policyConstraints, {}, 'merging shared health must never import another session policy')
+     assert.ok(reloaded.snapshot.models['zhipu/glm-4.5']?.totalFailures >= 1, 'non-policy failure records should be preserved')
+   } finally {
+     await rm(dir, { recursive: true, force: true })
+   }
+ })
++
++for (const scope of ['model', 'provider', 'endpoint'] as const) {
++  for (const blocker of ['cooldown', 'disabled', 'lease', 'expired'] as const) {
++    test(`atomic claim checks fresh ${scope} ${blocker}`, async () => {
++      const dir = await mkdtemp(join(tmpdir(), 'ccswitch-claim-'))
++      try {
++        const first = new HealthStore(dir), second = new HealthStore(dir)
++        await first.load(); await second.load()
++        const key = scope === 'model' ? modelKey(model) : scope === 'provider' ? model.provider : endpointKey(model)
++        const state = first.snapshot
++        const record = { consecutiveFailures: 1, totalFailures: 1,
++          cooldownUntil: blocker === 'expired' ? Date.now() - 1000 : blocker === 'cooldown' ? Date.now() + 60000 : undefined,
++          disabled: blocker === 'disabled', leaseUntil: blocker === 'lease' ? Date.now() + 60000 : undefined }
++        state[scope === 'model' ? 'models' : scope === 'provider' ? 'providers' : 'endpoints'][key] = record
++        await writeFile(first.file, JSON.stringify(state))
++        const results = await Promise.all([first.claimCandidate(model), second.claimCandidate(model)])
++        assert.equal(results.filter(Boolean).length, blocker === 'expired' ? 1 : 0)
++      } finally { await rm(dir, { recursive: true, force: true }) }
++    })
++  }
++}
++
++test('healthy candidates do not acquire a half-open lease', async () => {
++  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-healthy-'))
++  try {
++    const first = new HealthStore(dir), second = new HealthStore(dir)
++    await first.load(); await second.load()
++    assert.deepEqual(await Promise.all([first.claimCandidate(model), second.claimCandidate(model)]), [true, true])
++  } finally { await rm(dir, { recursive: true, force: true }) }
++})
++
++for (const reverse of [false, true]) {
++  test(`independent increments survive repeated merges (reverse=${reverse})`, async () => {
++    const dir = await mkdtemp(join(tmpdir(), 'ccswitch-counts-'))
++    try {
++      const seed = new HealthStore(dir)
++      await seed.load()
++      seed.recordFailure('provider', model.provider, 'quota')
++      seed.recordSwitch('a', 'b'); await seed.flush()
++      const a = new HealthStore(dir), b = new HealthStore(dir)
++      await a.load(); await b.load()
++      for (const store of [a, b]) {
++        store.recordFailure('provider', model.provider, 'quota')
++        store.recordSwitch('b', 'c')
++      }
++      const order = reverse ? [b, a] : [a, b]
++      for (const store of order) await store.flush()
++      // Force another dirty merge without new counter increments.
++      for (const store of order) { store.disable('other/model', true); await store.flush() }
++      const final = JSON.parse(await readFile(seed.file, 'utf8'))
++      assert.equal(final.providers[model.provider].totalFailures, 3)
++      assert.equal(final.switches, 3)
++      assert.equal(final.providers[model.provider].consecutiveFailures, 2)
++      assert.ok(final.providers[model.provider].cooldownUntil - final.providers[model.provider].lastFailureAt <= 60 * 60000)
++    } finally { await rm(dir, { recursive: true, force: true }) }
++  })
++}
++
++test('schema 2 migration preserves all health buckets and independent increments', async () => {
++  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-schema-'))
++  try {
++    const a = new HealthStore(dir), b = new HealthStore(dir)
++    const record = { totalFailures: 7, consecutiveFailures: 1, cooldownUntil: Date.now() + 60000 }
++    await writeFile(a.file, JSON.stringify({ schemaVersion: 2, updatedAt: 0,
++      models: { [modelKey(model)]: { ...record, disabled: true } },
++      providers: { [model.provider]: record }, endpoints: { [endpointKey(model)]: record },
++      switches: 4, contentPolicyFamilies: { glm: { observations: 1, avoidUntil: Date.now() + 60000 } } }))
++    await a.load(); await b.load()
++    assert.deepEqual(a.policyConstraints, {})
++    for (const store of [a, b]) {
++      store.recordFailure('provider', model.provider, 'quota')
++      store.recordSwitch('a', 'b')
++      await store.flush()
++    }
++    const final = new HealthStore(dir); await final.load()
++    assert.equal(final.snapshot.schemaVersion, 3)
++    assert.equal(final.snapshot.providers[model.provider].totalFailures, 9)
++    assert.equal(final.snapshot.switches, 6)
++    assert.equal(final.snapshot.models[modelKey(model)].disabled, true)
++    assert.equal(final.snapshot.endpoints[endpointKey(model)].totalFailures, 7)
++    assert.equal(JSON.parse(await readFile(a.file, 'utf8')).contentPolicyFamilies, undefined)
++  } finally { await rm(dir, { recursive: true, force: true }) }
++})
++
++for (const action of ['disable', 'reactivate', 'reactivateAll', 'reset-model', 'reset-all'] as const) {
++  test(`latest manual ${action} survives unrelated stale flush`, async t => {
++    let now = Date.now()
++    t.mock.method(Date, 'now', () => now)
++    const dir = await mkdtemp(join(tmpdir(), 'ccswitch-manual-'))
++    try {
++      const a = new HealthStore(dir), b = new HealthStore(dir)
++      await a.load()
++      a.disable(modelKey(model), action !== 'disable'); await a.flush()
++      await b.load()
++      now += 10
++      if (action === 'disable') a.disable(modelKey(model), true)
++      if (action === 'reactivate') await a.reactivate(model)
++      if (action === 'reactivateAll') await a.reactivateAll()
++      if (action === 'reset-model') a.reset(modelKey(model))
++      if (action === 'reset-all') a.reset('all')
++      await a.flush()
++      b.recordSwitch('unrelated', 'other'); await b.flush()
++      const check = new HealthStore(dir); await check.load()
++      assert.equal(Boolean(check.snapshot.models[modelKey(model)]?.disabled), action === 'disable')
++      if (action.startsWith('reset')) assert.equal(check.snapshot.models[modelKey(model)], undefined, 'reset history cannot reappear from a stale snapshot')
++    } finally { await rm(dir, { recursive: true, force: true }) }
++  })
++}
++
++for (const phase of ['load', 'flush', 'reset', 'claim'] as const) {
++  test(`unsupported schema is preserved on ${phase}`, async () => {
++    const dir = await mkdtemp(join(tmpdir(), 'ccswitch-future-schema-'))
++    try {
++      const store = new HealthStore(dir)
++      if (phase !== 'load') await store.load()
++      const original = JSON.stringify({ schemaVersion: 99, models: {}, providers: {}, endpoints: {}, futureData: 'preserve me' })
++      await writeFile(store.file, original)
++      if (phase === 'load') await store.load()
++      if (phase === 'reset') store.reset('all')
++      else store.recordFailure('provider', model.provider, 'quota')
++      if (phase === 'claim') assert.equal(await store.claimCandidate(model), false)
++      await store.flush()
++      assert.equal(await readFile(store.file, 'utf8'), original)
++      assert.match(await readFile(join(dir, 'ccswitch-auto-switch.log'), 'utf8'), /unsupported.*schema/i)
++    } finally { await rm(dir, { recursive: true, force: true }) }
++  })
++}
++
++test('schema downgrade after observing schema 3 blocks stale writes', async () => {
++  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-downgrade-'))
++  try {
++    const store = new HealthStore(dir)
++    await store.load(); store.recordSwitch('a', 'b'); await store.flush()
++    const old = JSON.stringify({ schemaVersion: 2, updatedAt: 0, models: {}, providers: {}, endpoints: {}, switches: 0 })
++    await writeFile(store.file, old)
++    store.recordSwitch('b', 'c'); await store.flush()
++    assert.equal(await store.claimCandidate(model), false)
++    assert.equal(await readFile(store.file, 'utf8'), old)
++    assert.match(await readFile(join(dir, 'ccswitch-auto-switch.log'), 'utf8'), /schema downgrade/)
++  } finally { await rm(dir, { recursive: true, force: true }) }
++})
++
++test('new manual enable supersedes a legacy disabled value on stale merge', async () => {
++  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-legacy-manual-'))
++  try {
++    const a = new HealthStore(dir), b = new HealthStore(dir)
++    await writeFile(a.file, JSON.stringify({ schemaVersion: 2, models: { [modelKey(model)]: { consecutiveFailures: 0, totalFailures: 0, disabled: true } }, providers: {}, endpoints: {}, updatedAt: 0 }))
++    await a.load(); await b.load()
++    await a.reactivate(model); await a.flush()
++    b.recordSwitch('x', 'y'); await b.flush()
++    const check = new HealthStore(dir); await check.load()
++    assert.equal(check.snapshot.models[modelKey(model)].disabled, false)
++  } finally { await rm(dir, { recursive: true, force: true }) }
++})
++
++for (const all of [false, true]) {
++  test(`reactivate all=${all} clears breakers added after load`, async () => {
++    const dir = await mkdtemp(join(tmpdir(), 'ccswitch-atomic-recovery-'))
++    try {
++      const a = new HealthStore(dir), b = new HealthStore(dir)
++      await a.load(); await b.load()
++      const other = { provider: 'other', id: 'other', baseUrl: 'https://other.test' }
++      const targets = all ? [model, other] : [model]
++      for (const target of targets) {
++        b.recordFailure('model', modelKey(target), 'unknown')
++        b.recordFailure('provider', target.provider, 'quota')
++        b.recordFailure('endpoint', endpointKey(target), 'endpoint')
++        b.disable(modelKey(target), true)
++      }
++      await b.flush()
++      const disk = JSON.parse(await readFile(b.file, 'utf8'))
++      for (const bucket of [disk.models, disk.providers, disk.endpoints]) {
++        for (const record of Object.values(bucket) as any[]) record.leaseUntil = Date.now() + 60000
++      }
++      await writeFile(b.file, JSON.stringify(disk))
++      const result = await (all ? a.reactivateAll() : a.reactivate(model))
++      // Verify persistence without an extra caller-side flush.
++      const check = new HealthStore(dir); await check.load()
++      for (const target of targets) assert.equal(check.isBlocked(target), false)
++      assert.equal(result, true)
++      for (const bucket of [check.snapshot.models, check.snapshot.providers, check.snapshot.endpoints]) {
++        for (const record of Object.values(bucket)) {
++          assert.equal(record.consecutiveFailures, 0)
++          assert.equal(record.totalFailures, 1, 'recovery preserves failure counters')
++          assert.equal(record.cooldownUntil, undefined)
++          assert.equal(record.leaseUntil, undefined)
++          assert.equal(record.disabled, false)
++          assert.ok(record.disabledUpdatedAt)
++        }
++      }
++    } finally { await rm(dir, { recursive: true, force: true }) }
++  })
++  for (const version of [99, 2]) {
++    test(`reactivate all=${all} refuses schema ${version}`, async () => {
++      const dir = await mkdtemp(join(tmpdir(), 'ccswitch-recovery-schema-'))
++      try {
++        const a = new HealthStore(dir); await a.load()
++        a.recordSwitch('a', 'b'); await a.flush()
++        const original = JSON.stringify({ schemaVersion: version, models: {}, providers: {}, endpoints: {}, updatedAt: 0 })
++        await writeFile(a.file, original)
++        assert.equal(await (all ? a.reactivateAll() : a.reactivate(model)), false)
++        assert.equal(await readFile(a.file, 'utf8'), original)
++        assert.match(await readFile(join(dir, 'ccswitch-auto-switch.log'), 'utf8'), /reactivat.*refused/i)
++      } finally { await rm(dir, { recursive: true, force: true }) }
++    })
++  }
++}
+diff --git a/test/integration.test.ts b/test/integration.test.ts
+index 51e91a7..e68efa4 100644
+--- a/test/integration.test.ts
++++ b/test/integration.test.ts
+@@ -1,6 +1,6 @@
+ import test from 'node:test'
+ import assert from 'node:assert/strict'
+-import { mkdtemp, rm } from 'node:fs/promises'
++import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+ import { readFileSync } from 'node:fs'
+ import { tmpdir } from 'node:os'
+ import { join } from 'node:path'
+@@ -188,18 +188,16 @@ test('content_policy failure switches to another model and records health', { co
+     await handlers.get('agent_settled')?.({}, ctx)
+     assert.deepEqual(selected, ['provider-c/qwen3-coder'], 'content policy should skip the entire rejected model family')
+ 
+-    // 新一轮内容审查故障转移仍会加载持久化的 glm 约束，同时累计本轮新发现的 qwen 约束。
++    // 新一轮内容审查故障转移仍会读取本 session 的 glm 约束，同时累计本轮新发现的 qwen 约束。
+     handlers.get('input')?.({ source: 'interactive', text: 'ask another sensitive question' }, ctx)
+     handlers.get('after_provider_response')?.({ status: 200, headers: {} }, ctx)
+     await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: unrestricted.provider, model: unrestricted.id, content: [], stopReason: 'error', errorMessage: 'content_filter' } }, ctx)
+     await handlers.get('agent_settled')?.({}, ctx)
+     assert.deepEqual(selected, ['provider-c/qwen3-coder', 'provider-d/claude-sonnet'], 'later policy failover should keep avoiding previously learned GLM models')
+-    // 台账应记录 model 级失败（冷却）以及系列级审查约束。
++    // 台账只记录 model 级失败（冷却），系列约束保留在 session 内存。
+     const state = JSON.parse(readFileSync(join(dir, 'ccswitch-auto-switch-state.json'), 'utf8'))
+     assert.ok(state.models['provider-a/glm-4.5']?.cooldownUntil > Date.now(), 'model should be cooling after content policy failure')
+-    assert.equal(state.contentPolicyFamilies?.glm?.lastModel, 'provider-a/glm-4.5')
+-    assert.ok(state.contentPolicyFamilies?.glm?.avoidUntil > Date.now())
+-    assert.equal(state.contentPolicyFamilies?.qwen?.lastModel, 'provider-c/qwen3-coder')
++    assert.equal(state.contentPolicyFamilies, undefined, 'policy families must not be persisted')
+     assert.equal(state.switches, 2)
+   } finally {
+     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+@@ -402,8 +400,10 @@ test('input with images but no multimodal candidate does nothing', { concurrency
+     assert.deepEqual(selected, [], 'should NOT switch when no multimodal candidate')
+     assert.ok(notifications.some(n => n.includes('没有可用的多模态候选') || n.includes('无可用的多模态候选')), 'should notify user about no multimodal candidate')
+     assert.equal(activeModel.provider, 'provider-a')
+-    const state = JSON.parse(readFileSync(join(dir, 'ccswitch-auto-switch-state.json'), 'utf8'))
+-    assert.equal(state.switches ?? 0, 0, 'no switch should have occurred')
++    const { HealthStore } = await import('../health.ts')
++    const store = new HealthStore(dir)
++    await store.load()
++    assert.equal(store.snapshot.switches ?? 0, 0, 'no switch should have occurred')
+   } finally {
+     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+     else process.env.PI_CODING_AGENT_DIR = previous
+@@ -576,7 +576,9 @@ test('same-platform provider copies are isolated as one platform after repeated
+ })
+ 
+ // --- 回归：ROUND_LIMIT 耗尽前，最后一个失败必须先落健康台账（否则下一轮还会重试同一个刚失败的模型）
+-test('final failure is recorded to health even when the round time limit is exceeded', { concurrency: false }, async () => {
++test('final failure is recorded to health even when the round time limit is exceeded', { concurrency: false }, async t => {
++  let now = Date.now()
++  t.mock.method(Date, 'now', () => now)
+   const dir = await mkdtemp(join(tmpdir(), 'ccswitch-timelimit-'))
+   const previous = process.env.PI_CODING_AGENT_DIR
+   process.env.CCSWITCH_ROUND_LIMIT_MS = '1'
+@@ -598,6 +600,7 @@ test('final failure is recorded to health even when the round time limit is exce
+     })
+     await handlers.get('session_start')?.({}, ctx)
+     handlers.get('input')?.({ source: 'interactive', text: 'trigger' }, ctx)
++    now += 2 // deterministic expiry; do not depend on filesystem latency
+     handlers.get('after_provider_response')?.({ status: 429, headers: {} }, ctx)
+     await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: 'provider-a', model: 'coder', content: [], stopReason: 'error', errorMessage: 'rate limit' } }, ctx)
+     await handlers.get('agent_settled')?.({}, ctx)
+@@ -615,3 +618,176 @@ test('final failure is recorded to health even when the round time limit is exce
+     await rm(dir, { recursive: true, force: true })
+   }
+ })
++
++for (const source of ['input', 'tool', 'retry-tool']) {
++  test(`image requirements survive subsequent failures: ${source}`, async () => {
++    const dir = await mkdtemp(join(tmpdir(), 'ccswitch-image-round-'))
++    const previous = process.env.PI_CODING_AGENT_DIR
++    process.env.PI_CODING_AGENT_DIR = dir
++    const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
++    const models: ModelRef[] = [
++      { provider: 'a', id: 'coder', input: ['text'] },
++      { provider: 'b', id: 'coder', input: ['text'] },
++      { provider: 'c', id: 'vision', input: ['text', 'image'] },
++      { provider: 'd', id: 'vision', input: ['text', 'image'] },
++      { provider: 'e', id: 'unknown' },
++    ]
++    const selected: string[] = []
++    const ctx: ExtensionContext = {
++      mode: 'rpc', hasUI: false, model: models[0], scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
++      modelRegistry: { refresh: async () => {}, getAvailable: () => models },
++      ui: { notify: () => {}, setStatus: () => {}, setWorkingMessage: () => {} },
++    }
++    const fail = async () => {
++      await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: ctx.model!.provider, model: ctx.model!.id, stopReason: 'error', errorMessage: 'unknown failure', content: [] } }, ctx)
++      await handlers.get('agent_settled')?.({}, ctx)
++    }
++    try {
++      extension({ on: (name, handler) => handlers.set(name, handler), registerCommand: () => {},
++        setModel: async model => { await Promise.resolve(); ctx.model = model; selected.push(model.provider); return true }, sendUserMessage: () => {} })
++      await handlers.get('session_start')?.({}, ctx)
++      await handlers.get('input')?.({ source: 'rpc', text: 'read image', images: source === 'input' ? [{ type: 'image', data: 'mock' }] : undefined }, ctx)
++      if (source === 'retry-tool') { await fail(); assert.equal(ctx.model?.provider, 'b') }
++      if (source !== 'input') {
++        await handlers.get('tool_execution_start')?.({}, ctx)
++        // Parallel tools may complete together; they must share one switch.
++        const toolsFinished = Promise.all([1, 2].map(() => handlers.get('tool_execution_end')?.({ result: { content: [{ type: 'image', data: 'mock' }] } }, ctx)))
++        await toolsFinished
++        assert.equal(ctx.model?.provider, 'c', 'awaited tool completion must select vision before request preparation')
++        const preparedModel = ctx.model
++        const selectionCount = selected.length
++        await handlers.get('before_provider_request')?.({}, ctx)
++        assert.equal(ctx.model, preparedModel)
++        assert.equal(selected.length, selectionCount, 'before-provider must not switch a prepared request')
++      }
++      assert.equal(ctx.model?.provider, 'c')
++      assert.equal(selected.filter(p => p === 'c').length, 1)
++      await fail()
++      assert.equal(ctx.model?.provider, 'd', 'next failure must still choose a vision model')
++      await fail()
++      assert.equal(ctx.model?.provider, 'd', 'unknown metadata and text-only models cannot handle remaining image round')
++    } finally {
++      await handlers.get('session_shutdown')?.({}, ctx)
++      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous
++      await rm(dir, { recursive: true, force: true })
++    }
++  })
++}
++
++test('starting another extension session cannot clear local policy families', { concurrency: false }, async () => {
++  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-session-policy-'))
++  const previous = process.env.PI_CODING_AGENT_DIR
++  process.env.PI_CODING_AGENT_DIR = dir
++  const models: ModelRef[] = [
++    { provider: 'a', id: 'glm-4.5', input: ['text'] },
++    { provider: 'b', id: 'glm-4.6', input: ['text'] },
++    { provider: 'c', id: 'qwen3', input: ['text'] },
++    { provider: 'd', id: 'claude-sonnet', input: ['text'] },
++  ]
++  const makeSession = () => {
++    const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
++    const commands = new Map<string, any>()
++    const messages: string[] = []
++    const ctx: ExtensionContext = {
++      mode: 'rpc', hasUI: true, model: models[0], scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
++      modelRegistry: { refresh: async () => {}, getAvailable: () => models },
++      ui: { notify: message => messages.push(message), setStatus: () => {}, setWorkingMessage: () => {} },
++    }
++    extension({ on: (name, handler) => handlers.set(name, handler), registerCommand: (name, command) => commands.set(name, command),
++      setModel: async model => { ctx.model = model; return true }, sendUserMessage: () => {} })
++    return { handlers, commands, messages, ctx }
++  }
++  const a = makeSession(), b = makeSession()
++  const emit = async (session: ReturnType<typeof makeSession>, event: string, data = {}) => session.handlers.get(event)?.(data, session.ctx)
++  const reject = async (session: ReturnType<typeof makeSession>) => {
++    await emit(session, 'input', { source: 'rpc', text: 'question' })
++    await emit(session, 'turn_end', { message: { role: 'assistant', provider: session.ctx.model!.provider, model: session.ctx.model!.id, stopReason: 'error', errorMessage: 'content_filter', content: [] } })
++    await emit(session, 'agent_settled')
++  }
++  try {
++    await emit(a, 'session_start'); await reject(a)
++    assert.equal(a.ctx.model?.provider, 'c')
++    await emit(b, 'session_start')
++    await a.commands.get('ccswitch').handler('status', a.ctx)
++    assert.match(a.messages.at(-1)!, /审查约束系列 1/)
++    await b.commands.get('ccswitch-test').handler('', b.ctx)
++    assert.match(b.messages.at(-1)!, /审查约束系列 0/)
++    await reject(a)
++    assert.equal(a.ctx.model?.provider, 'd', 'session A still avoids healthy GLM sibling after session B starts')
++    await emit(a, 'session_start')
++    await a.commands.get('ccswitch-test').handler('', a.ctx)
++    assert.match(a.messages.at(-1)!, /审查约束系列 0/)
++  } finally {
++    await emit(a, 'session_shutdown'); await emit(b, 'session_shutdown')
++    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous
++    await rm(dir, { recursive: true, force: true })
++  }
++})
++
++test('before-provider never starts a late switch when vision appears after input', async () => {
++  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-no-late-switch-'))
++  const previous = process.env.PI_CODING_AGENT_DIR
++  process.env.PI_CODING_AGENT_DIR = dir
++  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
++  const vision: ModelRef = { provider: 'vision', id: 'vision', input: ['text', 'image'] }
++  let available = [a], switches = 0
++  const ctx: ExtensionContext = { mode: 'rpc', hasUI: false, model: a, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
++    modelRegistry: { refresh: async () => {}, getAvailable: () => available },
++    ui: { notify: () => {}, setStatus: () => {}, setWorkingMessage: () => {} } }
++  try {
++    extension({ on: (name, handler) => handlers.set(name, handler), registerCommand: () => {}, sendUserMessage: () => {},
++      setModel: async model => { ctx.model = model; switches++; return true } })
++    await handlers.get('session_start')?.({}, ctx)
++    await handlers.get('input')?.({ source: 'rpc', text: 'image', images: [{ type: 'image', data: 'mock' }] }, ctx)
++    available = [a, vision]
++    await handlers.get('before_provider_request')?.({}, ctx)
++    assert.equal(switches, 0)
++    assert.equal(ctx.model, a)
++  } finally {
++    await handlers.get('session_shutdown')?.({}, ctx)
++    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous
++    await rm(dir, { recursive: true, force: true })
++  }
++})
++
++for (const surface of ['panel', 'command-model', 'command-all']) {
++  for (const unsupported of [false, true]) {
++    test(`recovery ${surface} reports persisted result (unsupported=${unsupported})`, async () => {
++      const dir = await mkdtemp(join(tmpdir(), 'ccswitch-recovery-ui-'))
++      const previous = process.env.PI_CODING_AGENT_DIR
++      process.env.PI_CODING_AGENT_DIR = dir
++      const handlers = new Map<string, any>(), commands = new Map<string, any>()
++      const notices: Array<{ message: string, type: string | undefined }> = []
++      const file = join(dir, 'ccswitch-auto-switch-state.json')
++      const ctx: ExtensionContext = { mode: 'tui', hasUI: true, model: a, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
++        modelRegistry: { refresh: async () => {}, getAvailable: () => [a] },
++        ui: { setStatus: () => {}, setWorkingMessage: () => {}, select: async () => '重新激活当前模型',
++          notify: (message, type) => {
++            notices.push({ message, type })
++            if (message.startsWith('已重新激活')) {
++              const state = JSON.parse(readFileSync(file, 'utf8'))
++              assert.equal(state.providers[a.provider].cooldownUntil, undefined, 'success notification must follow disk commit')
++            }
++          } } }
++      try {
++        extension({ on: (name, handler) => handlers.set(name, handler), registerCommand: (name, command) => commands.set(name, command),
++          setModel: async () => true, sendUserMessage: () => {} })
++        await handlers.get('session_start')({}, ctx)
++        const original = JSON.stringify({ schemaVersion: unsupported ? 99 : 3, updatedAt: 0, models: {}, endpoints: {},
++          providers: { [a.provider]: { consecutiveFailures: 1, totalFailures: 1, cooldownUntil: Date.now() + 60000 } } })
++        await writeFile(file, original)
++        const args = surface === 'panel' ? 'status' : surface === 'command-all' ? 'reactivate all' : `reactivate ${a.provider}/${a.id}`
++        await commands.get('ccswitch').handler(args, ctx)
++        if (unsupported) {
++          assert.ok(notices.some(n => n.type === 'error' && n.message.includes('重新激活失败')))
++          assert.equal(notices.some(n => n.message.startsWith('已重新激活')), false)
++          assert.equal(readFileSync(file, 'utf8'), original)
++        } else assert.ok(notices.some(n => n.message.startsWith('已重新激活')))
++      } finally {
++        await handlers.get('session_shutdown')?.({}, ctx)
++        if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous
++        await rm(dir, { recursive: true, force: true })
++      }
++    })
++  }
++}
+diff --git a/test/logic.test.ts b/test/logic.test.ts
+index b61b0d7..1466ed9 100644
+--- a/test/logic.test.ts
++++ b/test/logic.test.ts
+@@ -167,6 +167,22 @@ test('classifies Chinese quota/balance errors as provider quota', () => {
+   assert.equal(classifyFailure({ message: '403: {"code":"1058","message":"用户积分不足"}' }).kind, 'quota')
+   assert.equal(classifyFailure({ message: '403: {"code":"1058","message":"用户积分不足"}' }).scope, 'provider')
+   assert.equal(classifyFailure({ status: 403, message: '403: {"code":"1058","message":"用户积分不足"}' }).scope, 'provider')
++  assert.equal(classifyFailure({ status: 403, message: '403: {"code":"1058","message":"用户积分不足"}' }).kind, 'quota')
+   assert.equal(classifyFailure({ message: '您的账户余额不足，请充值后重试' }).kind, 'quota')
+   assert.equal(classifyFailure({ message: '账户已欠费，请及时续费' }).kind, 'quota')
+ })
++
++test('image-required rounds reject missing and empty input metadata', () => {
++  for (const input of [undefined, [], ['text']]) {
++    assert.equal(chooseCandidate([{ ...b, input }], { health, tried: new Set(), requiredInputs: ['text', 'image'] }), undefined)
++  }
++  assert.ok(chooseCandidate([{ ...b, input: undefined }], { health, tried: new Set(), requiredInputs: ['text'] }))
++})
++
++test('403 quota bodies outrank auth while plain forbidden stays auth', () => {
++  for (const message of ['用户积分不足', '余额不足', 'quota exceeded', 'insufficient balance', 'balance exhausted', 'not enough credits']) {
++    assert.deepEqual(classifyFailure({ status: 403, message }), { kind: 'quota', scope: 'provider', roundOnly: false })
++  }
++  assert.equal(classifyFailure({ status: 403, message: 'forbidden' }).kind, 'auth')
++  assert.equal(classifyFailure({ status: 401, message: 'unauthorized' }).kind, 'auth')
++})
