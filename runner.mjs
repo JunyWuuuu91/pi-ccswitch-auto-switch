@@ -4,18 +4,20 @@
  * extension retries a failed turn on another model.
  */
 import { spawn } from 'node:child_process'
-import { access, readFile, stat } from 'node:fs/promises'
+import { access, readFile, realpath, stat } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { delimiter, dirname, extname, isAbsolute, join, resolve } from 'node:path'
 
 export const EXIT = Object.freeze({ SUCCESS: 0, EXHAUSTED: 1, CONFIG: 2, TIMEOUT: 124, INTERRUPTED: 130, TERMINATED: 143 })
 export const DEFAULT_TIMEOUT_MS = 600_000
+export const INLINE_IMAGE_MAX_BYTES = 1.5 * 1024 * 1024
 
-const usage = `Usage: pi-ccswitch-run [options] [--] [@text-file ...] <prompt>
+const usage = `Usage: pi-ccswitch-run [options] [--] [@text-or-image-file ...] <prompt>
 
 Options:
   --timeout-ms <ms>       Total runner timeout (default: ${DEFAULT_TIMEOUT_MS})
+  --task-complexity <v>   auto, low, medium, high (omitted: keep Pi thinking)
   --no-tools              Disable Pi tools
   --no-context-files      Disable AGENTS.md / CLAUDE.md discovery
   --provider <name>       Initial Pi provider
@@ -35,11 +37,17 @@ export function parseArgs(argv) {
   const files = []
   const prompt = []
   let timeoutMs = DEFAULT_TIMEOUT_MS
+  let complexity
   let positional = false
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
     if (arg === '--') { positional = true; continue }
     if (!positional && (arg === '-h' || arg === '--help')) return { help: true }
+    if (!positional && arg === '--task-complexity') {
+      complexity = argv[++index]
+      if (!['auto', 'low', 'medium', 'high'].includes(complexity)) throw new Error('invalid --task-complexity')
+      continue
+    }
     if (!positional && arg === '--timeout-ms') {
       const raw = argv[++index]
       const value = Number(raw)
@@ -64,7 +72,19 @@ export function parseArgs(argv) {
     prompt.push(arg)
   }
   if (prompt.length === 0) throw new Error('a prompt is required')
-  return { timeoutMs, piArgs, files, prompt: prompt.join(' ') }
+  return { timeoutMs, piArgs, files, prompt: prompt.join(' '), ...(complexity ? { complexity } : {}) }
+}
+
+export function assessComplexity(prompt, fileText = '', imageCount = 0) {
+  const chars = prompt.length + fileText.length
+  // 只根据任务指令、输入规模和图片数量估计；不把附件正文当路由指令。
+  if (chars >= 20000 || imageCount >= 4 || /跨文章|跨聊天|主题脉络|交叉核验|因果分析|多来源|cross.source|synthesi[sz]/i.test(prompt)) {
+    return { level: 'high', reason: 'long-input-or-synthesis' }
+  }
+  if (imageCount || chars >= 2000 || /JSON|结构化|摘要|summari[sz]/i.test(prompt)) {
+    return { level: 'medium', reason: 'structured-or-visual' }
+  }
+  return { level: 'low', reason: 'short-text' }
 }
 
 export async function readTextFiles(fileArgs, cwd = process.cwd()) {
@@ -85,6 +105,60 @@ export async function readTextFiles(fileArgs, cwd = process.cwd()) {
 
 export function buildMessage(fileText, prompt) {
   return fileText ? `${fileText}\n${prompt}` : prompt
+}
+
+export async function readAttachments(fileArgs, cwd = process.cwd()) {
+  let fileText = ''
+  const images = []
+  for (const raw of fileArgs) {
+    const path = resolve(cwd, raw)
+    const info = await stat(path)
+    if (!info.isFile()) throw new Error(`not a regular file: ${path}`)
+    if (info.size > 20 * 1024 * 1024) throw new Error(`attachment exceeds 20 MiB: ${path}`)
+    const data = await readFile(path)
+    let mimeType
+    if (data.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))) mimeType = 'image/png'
+    else if (data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) mimeType = 'image/jpeg'
+    else if (/^GIF8[79]a$/.test(data.subarray(0, 6).toString('ascii'))) mimeType = 'image/gif'
+    else if (data.subarray(0, 4).toString() === 'RIFF' && data.subarray(8, 12).toString() === 'WEBP') mimeType = 'image/webp'
+    if (mimeType) {
+      if (images.length >= 20) throw new Error('at most 20 image attachments are supported')
+      images.push({ type: 'image', data: data.toString('base64'), mimeType })
+      fileText += `<file name="${path}">Image attachment ${images.length}</file>\n`
+    } else {
+      if (/\.(png|jpe?g|gif|webp|heic|heif|bmp|tiff?)$/i.test(path)) throw new Error(`invalid or unsupported image: ${path}`)
+      fileText += await readTextFiles([path])
+    }
+  }
+  return { fileText, images }
+}
+
+export async function normalizeLargeImages(images, resizeImage) {
+  const maxBytes = INLINE_IMAGE_MAX_BYTES
+  const result = []
+  for (const image of images) {
+    if (image.data.length <= maxBytes) { result.push(image); continue }
+    const resized = await resizeImage(Buffer.from(image.data, 'base64'), image.mimeType, { maxBytes })
+    if (!resized?.data || resized.data.length > maxBytes) throw new Error('image exceeds inline size limit after normalization')
+    result.push({ type: 'image', data: resized.data, mimeType: resized.mimeType })
+  }
+  return result
+}
+
+export async function prepareImages(images, resolvePi = resolvePiCommand) {
+  if (!images.some(image => image.data.length > INLINE_IMAGE_MAX_BYTES)) return images
+  const resolved = await resolvePi()
+  const executable = resolved.prefix[0] || resolved.command
+  const candidates = isAbsolute(executable) ? [executable]
+    : (process.env.PATH || '').split(delimiter).filter(Boolean).map(dir => join(dir, executable))
+  const found = candidates.find(path => existsSync(path))
+  if (!found) throw new Error('cannot locate Pi image normalizer for large attachments')
+  const entry = await realpath(found)
+  const normalizer = [join(dirname(entry), 'utils', 'image-resize.js'), join(dirname(entry), '..', 'utils', 'image-resize.js')]
+    .find(path => existsSync(path))
+  if (!normalizer) throw new Error('installed Pi does not expose image normalization for large attachments')
+  const { resizeImage } = await import(pathToFileURL(normalizer).href)
+  return normalizeLargeImages(images, resizeImage)
 }
 
 const LEGACY_RUNNER_STEMS = new Set(['pi-ccswitch-run', 'ccswitch-run'])
@@ -242,7 +316,14 @@ export async function run(options, runtime = {}) {
     if (!Array.isArray(commands?.commands) || !commands.commands.some((entry) => entry.name === 'ccswitch')) {
       throw new Error('CCSwitch extension did not load')
     }
-    await request('prompt', { message: options.message })
+    if (options.complexity && !options.piArgs.includes('--thinking')) {
+      const assessment = options.complexity === 'auto'
+        ? assessComplexity(options.prompt || '', options.fileText ?? options.message, options.images?.length || 0)
+        : { level: options.complexity, reason: 'explicit-complexity' }
+      await request('set_thinking_level', { level: assessment.level })
+      log(`complexity=${assessment.level} reason=${assessment.reason} images=${options.images?.length || 0}`)
+    }
+    await request('prompt', { message: options.message, ...(options.images?.length ? { images: options.images } : {}) })
     while (!terminal && !protocolError && !closed) await new Promise(resolveWait => setTimeout(resolveWait, 10))
     if (protocolError) {
       closeStdin()
@@ -282,8 +363,10 @@ export async function main(argv = process.argv.slice(2)) {
   try { options = parseArgs(argv) } catch (error) { process.stderr.write(`pi-ccswitch-run: ${error.message}\n${usage}\n`); return EXIT.CONFIG }
   if (options.help) { process.stdout.write(`${usage}\n`); return EXIT.SUCCESS }
   try {
-    const fileText = await readTextFiles(options.files)
-    const result = await run({ ...options, message: buildMessage(fileText, options.prompt) })
+    const attached = await readAttachments(options.files)
+    const fileText = attached.fileText
+    const images = await prepareImages(attached.images)
+    const result = await run({ ...options, fileText, images, message: buildMessage(fileText, options.prompt) })
     if (result.text) process.stdout.write(`${result.text}\n`)
     if (result.error) process.stderr.write(`pi-ccswitch-run: ${result.error}\n`)
     return result.code

@@ -90,7 +90,7 @@ cd ~/.pi/agent/npm && npm install pi-ccswitch-auto-switch@latest
 pi-ccswitch-run --no-tools --no-context-files @prompt.md "请总结附件"
 ```
 
-runner 内部只显式加载本扩展并启动一次 Pi RPC；`PI_BIN` 应指定内部真实 `pi`。为兼容旧配置，`PI_BIN=pi-ccswitch-run` 或 `PI_BIN=ccswitch-run` 会输出警告并降级到 `PATH` 中的 `pi`，避免递归和长驻消费方连续失败；其他任意命令仍会被拒绝。默认总超时为 10 分钟，可用 `--timeout-ms` 调整。退出码：成功 `0`、候选耗尽 `1`、参数/RPC 配置错误 `2`、超时 `124`、中断 `130/143`。首版只支持文本 `@文件`，不支持图片和 stdin。
+runner 内部只显式加载本扩展并启动一次 Pi RPC；`PI_BIN` 应指定内部真实 `pi`。为兼容旧配置，`PI_BIN=pi-ccswitch-run` 或 `PI_BIN=ccswitch-run` 会输出警告并降级到 `PATH` 中的 `pi`，避免递归和长驻消费方连续失败；其他任意命令仍会被拒绝。默认总超时为 10 分钟，可用 `--timeout-ms` 调整。退出码：成功 `0`、候选耗尽 `1`、参数/RPC 配置错误 `2`、超时 `124`、中断 `130/143`。支持文本及 PNG/JPEG/GIF/WebP `@文件`，按签名识别图片并传入 RPC images；损坏/不支持的图片及其他二进制附件明确拒绝。单附件上限 20 MiB，最多 20 张图片；不支持 stdin。
 
 正常使用 CC Switch 配置 Provider 即可；本插件不会修改 Pi 模型设置或 CC Switch 数据。
 
@@ -151,7 +151,7 @@ Pi 在把请求发给 Provider 时，会根据当前模型的 `input` 能力静�
 - 候选只选**明确声明**支持图片的模型（`input` 含 `image`）；元数据缺失的模型不冒险选择；
 - 图片能力要求贯穿整个故障转移轮次，包括重试验证阶段工具返回图片以及此后的再次切换；
 - 切换原因记为 `modality`，计入本 session 切换数与累计切换；
-- 如果没有可用的多模态候选，则通知用户并保持原模型继续（Pi 会照常剥图并附带提示）。
+- 如果没有可用的多模态候选，RPC 图片输入会返回 exhausted 终态并在发出剥图请求前停止；交互式 TUI 保持原有通知行为。
 
 模态预检只在 TUI/RPC 交互模式下生效（与故障转移一致）；print/json 模式只监控不切换。
 
@@ -170,6 +170,14 @@ npm test
 ```
 
 TypeScript 已显式列为开发依赖。`npm test` 开启 Node 原生 TypeScript 类型剥离，在 Node 22.19+ 上运行 `health`、`integration`、`logic`、`runner` 全部测试。测试使用 Node 内置测试运行器，覆盖失败分类矩阵、系列级审查避让、Provider 优先选择、输入兼容、冷却、状态持久化以及 Windows 路径。
+
+## 可选任务复杂度
+
+`--task-complexity auto` 根据任务指令、输入文字长度和图片数量估计推理强度：短文本使用 low；结构化摘要或图片使用 medium；至少 20,000 个字符、4 张图片或跨来源综合分析使用 high。也可显式指定 `low|medium|high`。这是确定性的任务估计，不是模型质量排名。
+
+默认沿用 Pi 当前模型；需要健康或视觉候选时由 CCSwitch 切换。Pi 会按模型能力限制推理强度。显式 `--thinking` 优先；省略 `--task-complexity` 时保留现有推理行为。runner 不写入全局设置。
+
+RPC 图片请求没有可选的视觉模型时返回 exhausted 终态，避免发送丢失图片的请求。交互式 TUI 行为保持不变。超过 1.5 MiB base64 的大图会通过已安装 Pi 的图片处理功能压缩后传入 RPC，保留原图；处理失败时明确报错。
 
 ## 许可证
 

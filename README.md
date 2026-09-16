@@ -96,7 +96,7 @@ pi-ccswitch-run --no-tools --no-context-files @prompt.md "Summarize the attached
 
 The runner starts one `pi --mode rpc --no-session --no-extensions --extension <this package>/index.ts` process, so only CCSwitch is loaded. `PI_BIN` may point to the real Pi executable. For migration safety, an old `PI_BIN=pi-ccswitch-run` or `PI_BIN=ccswitch-run` value emits a warning and falls back to `pi` on `PATH` instead of recursing or terminating every downstream job. Arbitrary commands are still rejected. The default deadline is ten minutes and can be changed with `--timeout-ms`.
 
-Exit codes are `0` for success, `1` when candidates are exhausted, `2` for invocation/RPC configuration failures, `124` for timeout, and `130`/`143` for interruption. Text `@files` are supported in the first release; images and stdin input are intentionally not.
+Exit codes are `0` for success, `1` when candidates are exhausted, `2` for invocation/RPC configuration failures, `124` for timeout, and `130`/`143` for interruption. Text and PNG/JPEG/GIF/WebP `@files` are supported. Images are detected by signature and sent as native RPC image parts; invalid image files and other binary formats are rejected. Each attachment is limited to 20 MiB and a request to 20 images. Stdin is not supported.
 
 ## Commands
 
@@ -163,7 +163,7 @@ CCSwitch therefore prechecks **before the request is sent**, instead of waiting 
 - Image requirements remain active for the entire failover round, including images returned by tools during retry verification and later fallback attempts;
 - Only models that **explicitly** support images (`input` includes `image`) are considered; models with missing metadata are never assumed to support images;
 - The switch reason is recorded as `modality` and counted in both the session and lifetime switch counters;
-- If no multimodal candidate is available, CCSwitch notifies the user and keeps the current model (Pi will still strip the image and add its notice).
+- If no multimodal candidate is available, RPC image input is handled with an exhausted terminal result before any image-omitted request is sent. Interactive TUI retains its existing notification behavior.
 
 The modality precheck applies only in interactive TUI/RPC sessions (the same scope as failover); print/json modes only monitor and never switch.
 
@@ -182,6 +182,20 @@ npm test
 ```
 
 TypeScript is an explicit development dependency. `npm test` enables Node’s native TypeScript stripping and runs all `health`, `integration`, `logic`, and `runner` suites on Node 22.19+. Tests use Node's built-in test runner and cover the failure matrix, family-level policy avoidance, provider-first selection, input compatibility, cooldowns, state persistence, and Windows-compatible paths.
+
+## Optional task complexity
+
+`--task-complexity auto` estimates reasoning effort from the task instruction, input text length,
+and image count. Short text uses low; structured summaries or images use medium; at least
+20,000 characters, 4 images, or cross-source synthesis uses high. This is a deterministic estimate,
+not a model-quality ranking. `low|medium|high` may also be supplied explicitly.
+The selected model stays on Pi defaults unless CCSwitch needs a healthy/vision fallback.
+Pi clamps thinking to model capabilities. An explicit `--thinking` wins; omitting task-complexity
+preserves existing thinking behavior. The runner does not write global settings.
+RPC image requests with no selectable image-capable model terminate with an exhausted result,
+rather than silently sending an image-omitted text request. Interactive TUI behavior is unchanged.
+
+Large images exceeding 1.5 MiB of base64 use the installed Pi image normalizer before RPC dispatch; originals are never modified. If Pi cannot normalize the image, the runner fails explicitly.
 
 ## License
 

@@ -17,7 +17,7 @@ const roundLimitMs = (): number => {
   return Number.isFinite(override) && override > 0 ? override : ROUND_LIMIT_DEFAULT
 }
 const RPC_PROTOCOL_VERSION = 1
-const EXTENSION_VERSION = '0.3.12'
+const EXTENSION_VERSION = '0.3.13'
 // 同端点（BaseURL 相同）连续失败达到该次数即隔离该端点，避免同一个平台的多个模型逐个试错耗尽本轮切换
 const ENDPOINT_FAIL_THRESHOLD = 3
 
@@ -394,6 +394,10 @@ export default function (pi: ExtensionAPI) {
     // 模态预检：输入带图片但当前模型不支持图片（非多模态）→ 主动切换到多模态模型，
     // 避免 Pi 静默剥图后模型只回答“看不到图片”（此类情况不会触发 failover）。
     if (event.images?.length && round.phase === 'monitoring') await proactiveModalitySwitch(ctx, round)
+    if (event.images?.length && ctx.mode === 'rpc' && !round.model?.input?.includes('image')) {
+      await exhaust(ctx, 'image input requires an available image-capable model')
+      return { action: 'handled' }
+    }
     return { action: 'continue' }
   })
   pi.on('before_provider_request', (_event, ctx) => {

@@ -791,3 +791,27 @@ for (const surface of ['panel', 'command-model', 'command-all']) {
     })
   }
 }
+
+test('RPC image input fails closed when no image model can be selected', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-image-required-'))
+  const previous = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = dir
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+  const entries: Array<{type: string, data: any}> = []
+  const ctx: ExtensionContext = { mode: 'rpc', hasUI: false, model: a, scopedModels: [], isIdle: () => true,
+    hasPendingMessages: () => false, abort: () => {},
+    modelRegistry: { refresh: async () => {}, getAvailable: () => [a] },
+    ui: { notify: () => {}, setStatus: () => {}, setWorkingMessage: () => {} } }
+  try {
+    extension({ on: (name, handler) => handlers.set(name, handler), registerCommand: () => {},
+      sendUserMessage: () => {}, appendEntry: (type, data) => entries.push({type, data}) })
+    await handlers.get('session_start')?.({}, ctx)
+    const result = await handlers.get('input')?.({source: 'rpc', text: 'read', images: [{type: 'image', data: 'fixture'}]}, ctx)
+    assert.equal(result.action, 'handled')
+    assert.ok(entries.some(e => e.type === 'ccswitch-exhausted' && /image/.test(e.data.reason)))
+  } finally {
+    await handlers.get('session_shutdown')?.({}, ctx)
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous
+    await rm(dir, {recursive: true, force: true})
+  }
+})
