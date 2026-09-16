@@ -201,3 +201,18 @@ test('large image normalizer resolves both standard and bundled Pi CLI layouts',
     }
   } finally { await rm(dir,{recursive:true,force:true}) }
 })
+
+
+test('npm-style symlink entry executes the runner CLI', async () => {
+  const { symlink } = await import('node:fs/promises')
+  const { execFileSync } = await import('node:child_process')
+  const { fileURLToPath } = await import('node:url')
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-bin-'))
+  try {
+    const entry = join(dir, 'pi-ccswitch-run.mjs')
+    await symlink(fileURLToPath(new URL('../runner.mjs', import.meta.url)), entry)
+    const output = execFileSync(process.execPath, [entry, '--help'], {encoding: 'utf8'})
+    assert.match(output, /Usage: pi-ccswitch-run/)
+    assert.match(output, /--task-complexity/)
+  } finally { await rm(dir, {recursive: true, force: true}) }
+})

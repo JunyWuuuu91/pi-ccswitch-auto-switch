@@ -376,5 +376,6 @@ export async function main(argv = process.argv.slice(2)) {
   }
 }
 
-const invoked = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+const invokedPath = process.argv[1] && await realpath(resolve(process.argv[1])).catch(() => undefined)
+const invoked = invokedPath === fileURLToPath(import.meta.url)
 if (invoked) main().then(code => { process.exitCode = code })
