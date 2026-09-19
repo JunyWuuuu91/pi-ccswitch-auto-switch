@@ -1,6 +1,6 @@
 {
   "name": "pi-ccswitch-auto-switch",
-  "version": "0.3.14",
+  "version": "0.3.15",
   "description": "Provider-first automatic model failover extension for Pi and CC Switch",
   "license": "MIT",
   "keywords": [

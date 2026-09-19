@@ -604,13 +604,20 @@ test('final failure is recorded to health even when the round time limit is exce
     handlers.get('after_provider_response')?.({ status: 429, headers: {} }, ctx)
     await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: 'provider-a', model: 'coder', content: [], stopReason: 'error', errorMessage: 'rate limit' } }, ctx)
     await handlers.get('agent_settled')?.({}, ctx)
-    // 1ms 轮时限 → 第一次失败即触发“超过本轮时间限制” exhaust；但失败必须已记录
+    // 轮时限已耗尽但本轮还没切过 → 第一次兜底必须执行（窗口只限制连续切换 churn）
+    assert.deepEqual(selected, ['provider-b/coder'], 'first fallback must run even when the round window already expired')
+    // 第二次失败时窗口自上次切换起再次耗尽（attempts > 0）→ exhaust；但失败必须先落台账
+    now += 2
+    handlers.get('after_provider_response')?.({ status: 429, headers: {} }, ctx)
+    await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: 'provider-b', model: 'coder', content: [], stopReason: 'error', errorMessage: 'rate limit 2' } }, ctx)
+    await handlers.get('agent_settled')?.({}, ctx)
     const state = JSON.parse(readFileSync(join(dir, 'ccswitch-auto-switch-state.json'), 'utf8'))
-    assert.ok(state.providers['provider-a']?.cooldownUntil > Date.now(), 'provider failure must be recorded before the time-limit exhaust')
+    assert.ok(state.providers['provider-b']?.cooldownUntil > Date.now(), 'provider failure must be recorded before the time-limit exhaust')
     const report = readFileSync(join(dir, 'ccswitch-failure-report.md'), 'utf8')
-    assert.match(report, /- provider-a\/coder/, 'tried list must contain the failing model')
-    assert.ok(notifications.some(n => n.includes('超过本轮时间限制') && n.includes('provider-a/coder')), 'notification should name the failing model')
-    assert.deepEqual(selected, [], 'no switch should happen when the time limit is already exhausted')
+    assert.match(report, /- provider-a\/coder — rate limit/, 'tried list must contain the first failing model')
+    assert.match(report, /- provider-b\/coder — rate limit 2/, 'tried list must contain the second failing model')
+    assert.ok(notifications.some(n => n.includes('超过本轮时间限制') && n.includes('provider-b/coder')), 'notification should name the failing model')
+    assert.deepEqual(selected, ['provider-b/coder'], 'no further switch after the time-limit exhaust')
   } finally {
     delete process.env.CCSWITCH_ROUND_LIMIT_MS
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
@@ -673,6 +680,42 @@ for (const source of ['input', 'tool', 'retry-tool']) {
     }
   })
 }
+
+test('429 account-quota failure parks the provider with quota cooldown instead of 5min rate-limit', { concurrency: false }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccswitch-429-quota-'))
+  const previous = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = dir
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+  const selected: string[] = []
+  const ctx: ExtensionContext = {
+    mode: 'tui', hasUI: true, model: a, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+    modelRegistry: { refresh: async () => {}, getAvailable: () => [a, b] },
+    ui: { notify: () => {}, setStatus: () => {}, setWorkingMessage: () => {} },
+  }
+  try {
+    extension({
+      on: (name, handler) => handlers.set(name, handler),
+      registerCommand: () => {},
+      setModel: async model => { ctx.model = model; selected.push(`${model.provider}/${model.id}`); return true },
+      sendUserMessage: () => {},
+    })
+    await handlers.get('session_start')?.({}, ctx)
+    handlers.get('input')?.({ source: 'interactive', text: 'trigger' }, ctx)
+    handlers.get('after_provider_response')?.({ status: 429, headers: {} }, ctx)
+    await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: 'provider-a', model: 'coder', content: [], stopReason: 'error', errorMessage: '429: {"code":"AccountQuotaExceeded","message":"You have exceeded the 5-hour usage quota. It will reset at 2026-09-19 13:50:43 +0800 CST.","type":"TooManyRequests"}' } }, ctx)
+    await handlers.get('agent_settled')?.({}, ctx)
+    assert.deepEqual(selected, ['provider-b/coder'], 'account quota should fail over to the healthy provider')
+    const state = JSON.parse(readFileSync(join(dir, 'ccswitch-auto-switch-state.json'), 'utf8'))
+    const record = state.providers['provider-a']
+    assert.equal(record.lastClass, 'quota', '429 quota body must not be classified as rate_limit')
+    const cooldown = record.cooldownUntil - record.lastFailureAt
+    assert.ok(cooldown >= 30 * 60_000, `account quota must park the provider for the quota cooldown tier, got ${cooldown}ms`)
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})
 
 test('starting another extension session cannot clear local policy families', { concurrency: false }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'ccswitch-session-policy-'))

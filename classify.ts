@@ -25,7 +25,13 @@ export function classifyFailure(observation: FailureObservation): Classification
   if (content.test(text)) return { kind: 'content_policy', scope: 'model', roundOnly: false }
   if (context.test(text)) return { kind: 'context_overflow', roundOnly: true }
   if (status === 413) return { kind: 'context_overflow', roundOnly: true }
-  if (status === 429) return { kind: 'rate_limit', scope: 'provider', roundOnly: false, retryAfterMs: observation.retryAfterMs }
+  // 账户级配额耗尽常以 429 上报（如 AccountQuotaExceeded + "exceeded the 5-hour usage quota"）。
+  // quota 文本必须优先于瞬时 rate_limit：否则死 provider 只按 5min 冷却停放，
+  // 在数小时后才重置的配额窗口内被放回健康池重试。
+  if (status === 429) {
+    if (quota.test(text)) return { kind: 'quota', scope: 'provider', roundOnly: false }
+    return { kind: 'rate_limit', scope: 'provider', roundOnly: false, retryAfterMs: observation.retryAfterMs }
+  }
   if (status === 402) return { kind: 'quota', scope: 'provider', roundOnly: false }
   if (status === 403 && quota.test(text)) return { kind: 'quota', scope: 'provider', roundOnly: false }
   if (status === 401 || status === 403) return { kind: 'auth', scope: 'provider', roundOnly: false }

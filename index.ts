@@ -17,7 +17,7 @@ const roundLimitMs = (): number => {
   return Number.isFinite(override) && override > 0 ? override : ROUND_LIMIT_DEFAULT
 }
 const RPC_PROTOCOL_VERSION = 1
-const EXTENSION_VERSION = '0.3.14'
+const EXTENSION_VERSION = '0.3.15'
 // 同端点（BaseURL 相同）连续失败达到该次数即隔离该端点，避免同一个平台的多个模型逐个试错耗尽本轮切换
 const ENDPOINT_FAIL_THRESHOLD = 3
 
@@ -309,9 +309,11 @@ export default function (pi: ExtensionAPI) {
     // 下一轮还会重试同一个刚失败的模型/provider
     if (!classification.roundOnly && classification.scope) health.recordFailure(classification.scope, classification.scope === 'model' ? failedKey : classification.scope === 'provider' ? round.model.provider : endpointKey(round.model), classification.kind, round.observation.message, classification.retryAfterMs)
     await health.flush()
-    // 窗口从上一次成功切换（或本轮开始）起算：供应商内部重试耗时不应消耗整轮限额
+    // 窗口从上一次成功切换（或本轮开始）起算：供应商内部重试耗时不应消耗整轮限额。
+    // 仅在本轮已成功切换过（attempts > 0）后才生效：窗口的本意是限制连续切换 churn，
+    // 长健康轮末尾的第一次失败也必须拿到兜底切换，否则轮时限会拦掉唯一一次 fallback。
     const windowStart = Math.max(round.startedAt, round.lastSwitchAt ?? 0)
-    if (Date.now() - windowStart >= roundLimitMs()) return exhaust(ctx, '超过本轮时间限制')
+    if (round.attempts > 0 && Date.now() - windowStart >= roundLimitMs()) return exhaust(ctx, '超过本轮时间限制')
     await refresh(ctx)
     const candidates = effectiveCandidates(ctx.scopedModels, ctx.modelRegistry.getAvailable())
     const candidateOptions = () => ({

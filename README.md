@@ -144,7 +144,7 @@ The state machine waits for Pi's native retry cycle to settle before switching. 
 | Failure | Scope | Initial cooldown |
 | --- | --- | --- |
 | `401`, `403`, quota, billing | Provider | 30 minutes |
-| `429` | Provider | `Retry-After` when present; otherwise 5 minutes |
+| `429` | Provider | quota/billing body (e.g. `AccountQuotaExceeded`) → 30 minutes; otherwise `Retry-After` when present, else 5 minutes |
 | DNS, network, `408`, `5xx`, interrupted stream | Endpoint | 2 minutes |
 | `404`, invalid model, incompatible parameters | Model | 15 minutes |
 | Content-policy or sensitive-content rejection | Current model + learned model-family constraint | 2-minute model cooldown; family evidence is session-scoped (cleared at `session_start`) |

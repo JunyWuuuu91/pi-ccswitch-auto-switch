@@ -186,3 +186,14 @@ test('403 quota bodies outrank auth while plain forbidden stays auth', () => {
   assert.equal(classifyFailure({ status: 403, message: 'forbidden' }).kind, 'auth')
   assert.equal(classifyFailure({ status: 401, message: 'unauthorized' }).kind, 'auth')
 })
+
+test('429 account-quota bodies classify as quota while plain 429 stays rate_limit', () => {
+  // 真实案例：账户配额耗尽以 429 上报 {"code":"AccountQuotaExceeded","message":"You have exceeded the 5-hour usage quota..."}；
+  // 若归为 rate_limit 只停 5min 冷却，死 provider 会在数小时后重置的配额窗口内被放回健康池重试
+  const message = '429: {"code":"AccountQuotaExceeded","message":"You have exceeded the 5-hour usage quota. It will reset at 2026-09-19 13:50:43 +0800 CST. We recommend upgrading your plan for more quota, or waiting for the reset.","param":"","type":"TooManyRequests"}'
+  assert.deepEqual(classifyFailure({ status: 429, message }), { kind: 'quota', scope: 'provider', roundOnly: false })
+  const plain = classifyFailure({ status: 429, message: 'rate limited', retryAfterMs: 30_000 })
+  assert.equal(plain.kind, 'rate_limit')
+  assert.equal(plain.scope, 'provider')
+  assert.equal(plain.retryAfterMs, 30_000)
+})
