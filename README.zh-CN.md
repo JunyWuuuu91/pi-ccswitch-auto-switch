@@ -1,5 +1,7 @@
 # Pi CCSwitch 自动故障转移
 
+> **推荐项目：** [Magpie](https://github.com/yetone/magpie)，适合统一管理多个 AI Agent 的模型、账号和路由。
+
 > English: [README.md](README.md)
 
 当 [CC Switch](https://ccswitch.io/) 管理 [Pi](https://github.com/badlogic/pi-mono) 的 Provider 时，为 Pi 提供更稳健的模型自动故障转移。

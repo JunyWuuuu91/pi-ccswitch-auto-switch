@@ -1,5 +1,7 @@
 # Pi CCSwitch Auto Switch
 
+> **Recommended project:** [Magpie](https://github.com/yetone/magpie) for managing models, accounts, and routing across multiple AI agents.
+
 > 中文说明：[README.zh-CN.md](README.zh-CN.md)
 
 Resilient model failover for [Pi](https://github.com/badlogic/pi-mono) when its providers are managed by [CC Switch](https://ccswitch.io/).
