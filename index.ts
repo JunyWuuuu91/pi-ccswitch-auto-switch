@@ -17,7 +17,7 @@ const roundLimitMs = (): number => {
   return Number.isFinite(override) && override > 0 ? override : ROUND_LIMIT_DEFAULT
 }
 const RPC_PROTOCOL_VERSION = 1
-const EXTENSION_VERSION = '0.3.15'
+const EXTENSION_VERSION = '0.3.16'
 // 同端点（BaseURL 相同）连续失败达到该次数即隔离该端点，避免同一个平台的多个模型逐个试错耗尽本轮切换
 const ENDPOINT_FAIL_THRESHOLD = 3
 
@@ -197,15 +197,16 @@ export default function (pi: ExtensionAPI) {
     round.phase = 'exhausted'
     clearWatchdog()
     ctx.ui.setWorkingMessage()
+    const lastFailure = round.observation ? classifyFailure(round.observation).kind : undefined
+    const recovery = lastFailure === 'local_runtime' ? '' : '\n\n可使用 /ccswitch status 查看状态，/ccswitch reactivate <provider/model|all> 重新激活。'
     // 报告列出本轮每个已试模型及其最后错误，便于直接定位是哪个 provider/模型、什么原因
     const triedLines = [...round.tried].map(item => {
       const error = round!.errors.get(item)
       return error ? `- ${item} — ${error}` : `- ${item}`
     })
-    await health.report(`# CCSwitch 自动故障转移失败\n\n时间：${new Date().toISOString()}\n原因：${reason}\n\n已尝试：\n${triedLines.join('\n')}\n\n可使用 /ccswitch status 查看状态，/ccswitch reactivate <provider/model|all> 重新激活。`)
+    await health.report(`# CCSwitch 自动故障转移失败\n\n时间：${new Date().toISOString()}\n原因：${reason}\n\n已尝试：\n${triedLines.join('\n')}${recovery}`)
     await health.log(`round exhausted: ${reason}; tried=${[...round.tried].join(',')}`)
     if (ctx.mode === 'rpc') {
-      const lastFailure = round.observation ? classifyFailure(round.observation).kind : undefined
       try {
         pi.appendEntry?.('ccswitch-exhausted', {
           protocolVersion: RPC_PROTOCOL_VERSION,
@@ -222,7 +223,7 @@ export default function (pi: ExtensionAPI) {
     }
     const currentKey = key(round.model)
     const currentError = currentKey ? round.errors.get(currentKey) : undefined
-    notify(ctx, `CCSwitch：自动切换停止（${reason}）${currentError ? `；当前 ${currentKey}：${currentError}` : ''}，请用 /ccswitch 查看详情`, 'error')
+    notify(ctx, `CCSwitch：自动切换停止（${reason}）${currentError ? `；当前 ${currentKey}：${currentError}` : ''}${lastFailure === 'local_runtime' ? '' : '，请用 /ccswitch 查看详情'}`, 'error')
     status(ctx)
   }
   /**
@@ -466,10 +467,20 @@ export default function (pi: ExtensionAPI) {
     }
   })
   pi.on('agent_settled', async (_event, ctx) => {
-    if (!round || round.phase !== 'settled-error') return
+    if (!round || round.phase !== 'settled-error' || !round.observation) return
     if (!ctx.isIdle()) return
-    if (!canRetry(ctx) && round.observation && round.model) {
-      const classification = classifyFailure(round.observation)
+    const classification = classifyFailure(round.observation)
+    // 本机 Pi 加载失败时，换任何模型都无益；必须在计入健康或平台失败次数前终止。
+    if (classification.kind === 'local_runtime') {
+      const failedKey = key(round.model)
+      if (failedKey) {
+        round.tried.add(failedKey)
+        round.errors.set(failedKey, round.observation.message ?? classification.kind)
+      }
+      await exhaust(ctx, 'Pi 本地程序文件加载失败，请完整退出并重新启动 Pi 后恢复会话；/reload 无法重新加载 Pi 本体')
+      return
+    }
+    if (!canRetry(ctx) && round.model) {
       if (classification.kind === 'content_policy') health.recordContentPolicyConstraint(modelFamily(round.model), round.model, round.observation.message)
       if (!classification.roundOnly && classification.scope) {
         const domain = classification.scope === 'model' ? modelKey(round.model) : classification.scope === 'provider' ? round.model.provider : endpointKey(round.model)

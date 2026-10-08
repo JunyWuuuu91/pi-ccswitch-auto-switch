@@ -18,6 +18,28 @@ test('classifies provider-wide failures before model failures', () => {
   assert.deepEqual(classifyFailure({ status: 404, message: 'model not found' }).scope, 'model')
 })
 
+test('Pi bundle loading errors stay local without penalizing model health', () => {
+  for (const path of [
+    '/opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/chunks/openai-completions-GWHGMQ3T.js',
+    'file:///opt/pi/node_modules/@mariozechner/pi-coding-agent/dist/bundle/chunks/anthropic-messages-MVG2FL56.js',
+    'C:\\Users\\user\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\chunks\\openai-codex-responses-GK67DQQJ.js',
+  ]) {
+    assert.deepEqual(classifyFailure({ message: `Cannot find module '${path}' imported from /opt/pi/cli.js` }), {
+      kind: 'local_runtime', roundOnly: true,
+    })
+  }
+})
+
+test('missing models and non-Pi modules remain eligible for normal failover', () => {
+  assert.equal(classifyFailure({ status: 404, message: "Cannot find model 'coder'" }).kind, 'model_config')
+  for (const message of [
+    "Cannot find module '/opt/extensions/custom.js'",
+    "Cannot find package 'custom-dependency' imported from /opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/chunks/chunk-A.js",
+  ]) {
+    assert.deepEqual(classifyFailure({ message }), { kind: 'unknown', scope: 'model', roundOnly: false })
+  }
+})
+
 test('does not poison global health for context failures; content policy flags the model for switch', () => {
   // context overflow 是内容本身超长：roundOnly，切换模型无益（且 chooseCandidate 有更大上下文过滤）
   assert.equal(classifyFailure({ message: 'context window exceeded' }).roundOnly, true)

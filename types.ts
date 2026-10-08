@@ -63,6 +63,7 @@ export type FailureClass =
   | 'model_config'
   | 'content_policy'
   | 'context_overflow'
+  | 'local_runtime'
   | 'unknown'
 
 export type HealthScope = 'model' | 'provider' | 'endpoint'

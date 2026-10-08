@@ -15,6 +15,7 @@ The extension observes real Pi requests, records sanitized health signals, andâ€
 - Endpoint circuit breakers for DNS, connection, server, and streaming failures.
 - Endpoint platform isolation: when several models on the same endpoint (same BaseURL/provider) fail within one round, the whole endpoint is isolated so sibling models from the same platform are not tried one by one.
 - Model-only isolation for missing models and incompatible parameters.
+- Stops on missing Pi bundle chunks with a full-restart hint, without penalizing model/provider/endpoint health or isolating a platform.
 - Learns model-family content-policy constraints from real failures (`glm-4.5` and `GLM-4.6`, for example, are both `glm`) and avoids the entire family during the current content-policy failover chain. Evidence lives only in the owning extension instance, is never written to shared health state, and is cleared at that instanceâ€™s `session_start`, because a new session may handle tasks that are not content-sensitive, so the family becomes eligible again until this session observes its own content-policy rejection.
 - Applies hard health, failure-domain, policy-family, input-modality, and context filters before ranking candidates by provider diversity, model equivalence, capability compatibility, and historical reliability.
   - Independent-provider semantics: a copied vendor (e.g. `my-provider-copy`) shares the BaseURL but is a distinct provider with its own endpoint key, so isolating one never blocks the other.
@@ -59,7 +60,9 @@ This works on macOS, Linux, and Windows when Git is available. After the npm rel
 pi install npm:pi-ccswitch-auto-switch
 ```
 
-Restart Pi or run `/reload` after installing or updating. To update the Git installation later, run `pi update --extensions`.
+Restart Pi or run `/reload` after installing or updating this extension. To update the Git installation later, run `pi update --extensions`.
+
+After updating **Pi itself**, fully exit and restart Pi, then resume your session. `/reload` reloads extensions and resources within the existing process. If that process still references replaced Pi bundle chunks and reports `Cannot find module .../pi-coding-agent/dist/bundle/chunks/...`, CCSwitch stops the current round and asks you to restart Pi. This local loading failure does not count toward model/provider/endpoint cooldowns or the three-failure platform isolation threshold.
 
 CC Switch should be configured normally. This extension deliberately does not write Pi model settings or CC Switch data.
 

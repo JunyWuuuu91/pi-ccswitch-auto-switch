@@ -14,6 +14,7 @@
 - 对认证、额度、账单和限流实施 Provider 优先熔断。
 - 对 DNS、连接、服务端和流中断实施端点熔断。
 - 模型不存在或参数不兼容时仅隔离该模型。
+- Pi 本地程序分块文件缺失时停止本轮切换并提示完整重启，不计入模型、Provider 或端点健康，也不触发平台隔离。
 - 内容审查失败会学习模型系列约束（例如 `glm-4.5`、`GLM-4.6` 同属 `glm`），在本轮内容审查故障转移中避开整个受限系列。该约束仅保存在当前扩展实例的内存中，不写入共享健康状态；当前实例的 `session_start` 只清除自身约束，因为新 session 处理的任务不一定涉及审查内容，模型系列恢复可用，直到本 session 再次观察到内容审查拒绝。
 - 候选模型先经过健康、故障域、审查系列、输入模态和上下文窗口硬过滤，再按跨 Provider、模型等价性、能力兼容和历史稳定性排序。
 - 首响应 90 秒、流式停滞 120 秒看门狗。
@@ -57,7 +58,9 @@ pi install git:github.com/JunyWuuuu91/pi-ccswitch-auto-switch
 pi install npm:pi-ccswitch-auto-switch
 ```
 
-安装或更新后重启 Pi，或执行 `/reload`。后续更新 Git 版本可执行 `pi update --extensions`。
+安装或更新本扩展后重启 Pi，或执行 `/reload`。后续更新 Git 版本可执行 `pi update --extensions`。
+
+更新 **Pi 本体**后，应完整退出并重新启动 Pi，再恢复原会话。`/reload` 只在现有进程中重载扩展和资源。如果旧进程仍引用已被替换的 Pi 程序分块文件，报出 `Cannot find module .../pi-coding-agent/dist/bundle/chunks/...`，CCSwitch 会停止本轮切换并提示重启 Pi。这类本地加载错误不计入模型、Provider 或端点冷却，也不累计到“失败 3 次隔离平台”的阈值。
 
 ### 无头自动化调用
 

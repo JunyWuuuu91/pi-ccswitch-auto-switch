@@ -14,11 +14,14 @@ const quota = /quota|billing|insufficient.?balance|out of budget|usage.?limit|cr
 const context = /context.?window|context.?length|too many tokens|prompt is too long|input is too long|token limit/i
 const transport = /dns|enotfound|eai_again|econn(?:reset|refused|aborted)|epipe|socket|connection|network|fetch failed|tls|certificate|timed? ?out|timeout|stream ended|terminated|websocket|und_err/i
 const overloaded = /overload|server busy|service unavailable|temporarily unavailable|capacity|upstream|bad gateway/i
+// 只匹配缺失的 Pi 分块文件本身，不能把 imported from 中的 Pi 路径当成缺失目标。
+const localRuntime = /cannot find (?:module|package) ['"][^'"\r\n]*[\\/]pi-coding-agent[\\/]dist[\\/]bundle[\\/]chunks[\\/][^'"\r\n]+['"]/i
 
 export function classifyFailure(observation: FailureObservation): Classification {
   const text = `${observation.rawStopReason ?? ''} ${observation.message ?? ''}`
   const status = observation.status
   if (observation.aborted && !observation.watchdog) return { kind: 'unknown', roundOnly: true }
+  if (localRuntime.test(text)) return { kind: 'local_runtime', roundOnly: true }
   if (observation.watchdog) return { kind: 'timeout', scope: 'endpoint', roundOnly: false }
   // 内容审查/敏感拦截属于该模型的失败：按 model 级记录并与冷却（2min×2ⁿ 上限 30min），
   // chooseCandidate 会排除后自动切换到其他模型，而不是同一内容原样重试到本轮上限。

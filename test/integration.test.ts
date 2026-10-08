@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import extension from '../index.ts'
-import { endpointKey } from '../health.ts'
+import { endpointKey, HealthStore } from '../health.ts'
 import type { ExtensionContext, ModelRef } from '../types.ts'
 
 const a: ModelRef = { provider: 'provider-a', id: 'coder', contextWindow: 128000, input: ['text'], reasoning: true }
@@ -206,7 +206,7 @@ test('content_policy failure switches to another model and records health', { co
   }
 })
 
-test('all non-user-cancel error classes reach normal failover', { concurrency: false }, async () => {
+test('provider error classes reach normal failover', { concurrency: false }, async () => {
   const cases: Array<{ name: string, status?: number, error: string, rawStopReason?: string }> = [
     { name: 'auth', status: 401, error: 'unauthorized' },
     { name: 'quota', status: 402, error: 'payment required' },
@@ -248,6 +248,73 @@ test('all non-user-cancel error classes reach normal failover', { concurrency: f
       if (['server', 'request timeout', 'transport'].includes(failure.name)) {
         const state = JSON.parse(readFileSync(join(dir, 'ccswitch-auto-switch-state.json'), 'utf8'))
         assert.ok(state.endpoints[endpointKey(source)], `${failure.name} should retain BaseURL metadata and open the correct endpoint breaker`)
+      }
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+      else process.env.PI_CODING_AGENT_DIR = previous
+      await rm(dir, { recursive: true, force: true })
+    }
+  }
+})
+
+test('Pi bundle loading failure stops once in every mode without changing health', { concurrency: false }, async () => {
+  for (const mode of ['tui', 'rpc', 'print', 'json'] as const) {
+    const dir = await mkdtemp(join(tmpdir(), `ccswitch-local-runtime-${mode}-`))
+    const previous = process.env.PI_CODING_AGENT_DIR
+    process.env.PI_CODING_AGENT_DIR = dir
+    const handlers = new Map<string, (event: any, ctx: ExtensionContext) => any>()
+    const selected: string[] = []
+    const sent: unknown[] = []
+    const notices: string[] = []
+    const entries: Array<{ customType: string, data: Record<string, unknown> }> = []
+    const statuses: string[] = []
+    const ctx: ExtensionContext = {
+      mode, hasUI: mode === 'tui', model: a, scopedModels: [], isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
+      modelRegistry: { refresh: async () => {}, getAvailable: () => [a, a2, b] },
+      ui: { notify: message => notices.push(message), setStatus: (_key, text) => { if (text) statuses.push(text) }, setWorkingMessage: () => {} },
+    }
+    try {
+      const existingHealth = new HealthStore(dir)
+      await existingHealth.load()
+      existingHealth.recordFailure('provider', 'historical-provider', 'auth', 'previous failure')
+      await existingHealth.flush()
+      extension({
+        on: (name, handler) => handlers.set(name, handler), registerCommand: () => {},
+        setModel: async model => { selected.push(`${model.provider}/${model.id}`); return true },
+        sendUserMessage: content => sent.push(content),
+        appendEntry: (customType, data) => entries.push({ customType, data }),
+      })
+      await handlers.get('session_start')?.({}, ctx)
+      const baseline = JSON.parse(readFileSync(join(dir, 'ccswitch-auto-switch-state.json'), 'utf8'))
+      await handlers.get('input')?.({ source: mode === 'rpc' ? 'rpc' : 'interactive', text: 'continue after Pi update' }, ctx)
+      const errorMessage = "Cannot find module '/opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/chunks/openai-completions-GWHGMQ3T.js' imported from /opt/pi/cli.js"
+      await handlers.get('turn_end')?.({ message: { role: 'assistant', provider: a.provider, model: a.id, content: [], stopReason: 'error', errorMessage } }, ctx)
+      await handlers.get('agent_settled')?.({}, ctx)
+      await handlers.get('agent_settled')?.({}, ctx)
+      await handlers.get('session_shutdown')?.({}, ctx)
+      assert.deepEqual(selected, [], `${mode}: local runtime failure must not switch models`)
+      assert.deepEqual(sent, [], `${mode}: local runtime failure must not send a continuation`)
+      assert.deepEqual(JSON.parse(readFileSync(join(dir, 'ccswitch-auto-switch-state.json'), 'utf8')), baseline, `${mode}: model, provider and endpoint health must stay unchanged`)
+      assert.match(statuses.at(-1) ?? '', /停止/)
+      const log = readFileSync(join(dir, 'ccswitch-auto-switch.log'), 'utf8')
+      assert.doesNotMatch(log, /isolating platform|没有健康的候选模型/)
+      const report = readFileSync(join(dir, 'ccswitch-failure-report.md'), 'utf8')
+      assert.match(report, /Pi.*重新启动/)
+      assert.doesNotMatch(report, /reactivate/)
+      assert.match(report, /openai-completions-GWHGMQ3T\.js/)
+      if (mode === 'tui') {
+        assert.equal(notices.length, 1, 'duplicate settled events must not repeat the restart notification')
+        assert.match(notices[0], /Pi.*重新启动/)
+        assert.match(notices[0], /\/reload/)
+      }
+      assert.equal(entries.length, mode === 'rpc' ? 1 : 0)
+      if (mode === 'rpc') {
+        assert.equal(entries[0].customType, 'ccswitch-exhausted')
+        assert.equal(entries[0].data.protocolVersion, 1)
+        assert.equal(entries[0].data.lastFailure, 'local_runtime')
+        assert.equal(entries[0].data.attempts, 0)
+        assert.deepEqual(entries[0].data.tried, ['provider-a/coder'])
+        assert.match(String(entries[0].data.reason), /Pi.*重新启动/)
       }
     } finally {
       if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
